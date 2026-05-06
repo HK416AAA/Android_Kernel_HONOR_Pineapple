@@ -1,0 +1,14 @@
+#
+# Runtime Verification configuration
+#
+menu "honor runtime verification support"
+
+config RUNTIME_VERIFICATION_LOGGER
+	tristate "runtime verification log driver"
+	default n
+	depends on LOGGER
+        depends on KRETPROBES
+	help
+          This adds support for verification event buffer.
+          This adds support for kernel functional instrument.
+endmenu

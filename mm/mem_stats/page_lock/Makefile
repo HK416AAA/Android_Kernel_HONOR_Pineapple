@@ -1,0 +1,1 @@
+obj-$(CONFIG_DEBUG_PAGE_LOCK)	+= page_lock_debug.o

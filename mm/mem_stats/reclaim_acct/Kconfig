@@ -1,0 +1,5 @@
+config RECLAIM_ACCT
+	bool "Honor memory reclaim delay accounting"
+	default n
+	help
+	  Honor memory reclaim delay accounting. Never use it as a kernel module.

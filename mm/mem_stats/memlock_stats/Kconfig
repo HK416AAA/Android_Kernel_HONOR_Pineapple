@@ -1,0 +1,5 @@
+config HONOR_MEMLOCK_STATS
+	bool "Honor memory lock statistics"
+	default n
+	help
+	  Honor memory lock accounting. Never use it as a kernel module.

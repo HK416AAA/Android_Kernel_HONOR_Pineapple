@@ -1,0 +1,8 @@
+config HN_MONITOR
+	tristate "hn monitor"
+	default n
+
+config HN_MONITOR_GKI
+	bool "hn monitor for gki"
+	depends on HN_MONITOR
+	default n

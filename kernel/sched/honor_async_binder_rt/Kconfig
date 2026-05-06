@@ -1,0 +1,11 @@
+# Add iAware async binder rt
+config HN_SET_ASYNC_BINDER_RT
+	bool "iaware 7.0 set async binder rt"
+	default n
+	help
+	  if set, the priority of opposite binder thread(include releaseBufferCallback,updateInputFlinger and startAnimation) will be set to realtime
+config HN_ASYNC_BINDER_THREAD_PRIO_RT
+	bool "iaware 7.0 set async binder rt"
+	default n
+	help
+	  if set, the priority of opposite binder thread(include releaseBufferCallback) will be set to realtime

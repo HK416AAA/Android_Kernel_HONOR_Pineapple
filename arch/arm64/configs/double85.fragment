@@ -1,0 +1,3 @@
+# Kconfigs for double85 build
+CONFIG_HONOR_DEBUG=n
+CONFIG_DEBUG_PREEMPT=n

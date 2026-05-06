@@ -1,0 +1,1 @@
+obj-$(CONFIG_HN_DC_MODULE) += hn_dc_util.o hn_dc_interface.o hn_dc_core.o

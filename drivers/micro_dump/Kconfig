@@ -1,0 +1,12 @@
+config HN_MICRODUMP
+	bool "micro dump."
+	default n
+
+config HN_MICRODUMP_DEFAULT_ENABLE
+	bool "microdump default enable."
+	default n
+
+config HN_MICRODUMP_TEST
+	bool "micro dump test"
+	depends on HN_MICRODUMP
+	default n
