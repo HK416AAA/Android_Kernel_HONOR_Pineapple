@@ -9,22 +9,23 @@ permissions:
 jobs:
   merge:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 420
     steps:
       - name: Full checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fetch linux-6.1.y and merge
+      - name: Fetch linux-6.1.y (full history) and merge
         shell: bash
         run: |
           set -e
           git config user.email "merge@local"
           git config user.name "merge-bot"
           git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git || true
-          git fetch --depth=1 stable refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
-          echo "upstream_sublevel=$(git show -s --format=%H refs/remotes/stable/linux-6.1.y) $(git show refs/remotes/stable/linux-6.1.y:Makefile | grep -E '^(SUBLEVEL|EXTRAVERSION) =' | tr '\n' ' ')"
+          git fetch stable refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
+          echo "upstream=$(git show -s --format=%H refs/remotes/stable/linux-6.1.y) sublevel=$(git show refs/remotes/stable/linux-6.1.y:Makefile | grep '^SUBLEVEL =')"
+          echo "merge-base=$(git merge-base HEAD refs/remotes/stable/linux-6.1.y || echo NONE)"
           git merge --no-edit refs/remotes/stable/linux-6.1.y || true
           git status --short > merge_status.txt
           git diff --name-only --diff-filter=U > conflicts.txt || true
