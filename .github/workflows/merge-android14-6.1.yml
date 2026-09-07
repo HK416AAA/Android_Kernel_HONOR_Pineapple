@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   apply:
@@ -24,36 +24,26 @@ jobs:
           git fetch stable refs/tags/v6.1.128:refs/tags/v6.1.128 refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
           git show refs/remotes/stable/linux-6.1.y:Makefile | grep '^SUBLEVEL ='
 
-      - name: Apply 128..187 stable diff (3way with reject)
+      - name: Apply and diagnose
         shell: bash
         run: |
           set -e
-          git config user.email "merge@local"
-          git config user.name "merge-bot"
           git diff refs/tags/v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
           echo "patch_files=$(git apply --numstat /tmp/stable.patch | wc -l)"
+          echo "makefile_in_patch=$(git apply --numstat /tmp/stable.patch | grep -c Makefile || true)"
           git apply --3way --reject --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
-          git ls-files -u | awk '{print $4}' | sort -u > unmerged.txt || true
-          find . -name '*.rej' -type f | sort > rejects.txt || true
-          echo "conflict_count=$(wc -l < unmerged.txt || echo 0)"
-          echo "reject_count=$(wc -l < rejects.txt || echo 0)"
-          echo "=== unmerged ==="; cat unmerged.txt
-          echo "=== rejects ==="; cat rejects.txt
-          CONFLICTS=$(wc -l < unmerged.txt || echo 0)
-          if [ "$CONFLICTS" = "0" ]; then
-            git add -A
-            git commit -m "kernel: bump stable 6.1.128 -> 6.1.187" || echo "nothing to commit"
-            echo "new_sublevel=$(git show HEAD:Makefile | grep '^SUBLEVEL =')"
-            git push origin HEAD:refs/heads/bump-stable-6.1.187
-          else
-            echo "has conflicts, not committing"
-          fi
+          echo "apply_error_lines=$(grep -c 'error' /tmp/apply.out || true)"
+          echo "=== apply errors head ==="; grep error /tmp/apply.out | head -30
+          echo "=== makefile diff after ==="; git diff -- Makefile | head -20
+          echo "=== sublevel now ==="; grep '^SUBLEVEL =' Makefile
+          git status --short > merge_status.txt || true
 
-      - name: Upload merge report
+      - name: Upload diag
         uses: actions/upload-artifact@v4
         with:
           name: merge-report
           path: |
-            unmerged.txt
-            rejects.txt
+            /tmp/apply.out
+            /tmp/stable.patch
+            merge_status.txt
           if-no-files-found: ignore
