@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apply:
@@ -33,22 +33,27 @@ jobs:
           git diff refs/tags/v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
           echo "patch_files=$(git apply --numstat /tmp/stable.patch | wc -l)"
           git apply --3way --reject --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
-          git status --short > merge_status.txt || true
-          git diff --name-only --diff-filter=U > conflicts.txt || true
           git ls-files -u | awk '{print $4}' | sort -u > unmerged.txt || true
           find . -name '*.rej' -type f | sort > rejects.txt || true
           echo "conflict_count=$(wc -l < unmerged.txt || echo 0)"
           echo "reject_count=$(wc -l < rejects.txt || echo 0)"
           echo "=== unmerged ==="; cat unmerged.txt
           echo "=== rejects ==="; cat rejects.txt
+          CONFLICTS=$(wc -l < unmerged.txt || echo 0)
+          if [ "$CONFLICTS" = "0" ]; then
+            git add -A
+            git commit -m "kernel: bump stable 6.1.128 -> 6.1.187" || echo "nothing to commit"
+            echo "new_sublevel=$(git show HEAD:Makefile | grep '^SUBLEVEL =')"
+            git push origin HEAD:refs/heads/bump-stable-6.1.187
+          else
+            echo "has conflicts, not committing"
+          fi
 
       - name: Upload merge report
         uses: actions/upload-artifact@v4
         with:
           name: merge-report
           path: |
-            merge_status.txt
-            conflicts.txt
             unmerged.txt
             rejects.txt
           if-no-files-found: ignore
