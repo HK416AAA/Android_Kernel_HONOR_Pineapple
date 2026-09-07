@@ -22,7 +22,7 @@ jobs:
           set -e
           git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git || true
           git fetch stable refs/tags/v6.1.128:refs/tags/v6.1.128 refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
-          git show refs/remotes/stable/linux-6.1.y:Makefile | grep '^SUBLEVEL ='
+          git show linux-6.1.y:Makefile | grep '^SUBLEVEL ='
 
       - name: Apply 128..187 stable diff (3way)
         shell: bash
@@ -30,13 +30,15 @@ jobs:
           set -e
           git config user.email "merge@local"
           git config user.name "merge-bot"
-          git diff refs/tags/v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
+          git diff v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
           echo "patch_files=$(git apply --numstat /tmp/stable.patch | wc -l)"
-          git apply --3way --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
+          git apply --3way --reject --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
           echo "apply_failed=$(grep -c 'error' /tmp/apply.out || true)"
           git status --short > merge_status.txt || true
           git diff --name-only --diff-filter=U > conflicts.txt || true
           git ls-files -u | awk '{print $4}' | sort -u > unmerged.txt || true
+          find . -name '*.rej' -type f | sort > rejects.txt || true
+          echo "reject_count=$(wc -l < rejects.txt || echo 0)"
           echo "conflict_count=$(wc -l < unmerged.txt || echo 0)"
           echo "=== unmerged ==="; cat unmerged.txt
           echo "=== apply errors sample ==="; grep error /tmp/apply.out | head -20
@@ -49,4 +51,5 @@ jobs:
             merge_status.txt
             conflicts.txt
             unmerged.txt
+            rejects.txt
           if-no-files-found: ignore
