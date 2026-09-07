@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  apply:
+  merge:
     runs-on: ubuntu-24.04
     timeout-minutes: 420
     steps:
@@ -16,34 +16,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch stable refs (v6.1.128 and linux-6.1.y)
+      - name: Fetch google android14-6.1 (full) and merge
         shell: bash
         run: |
           set -e
-          git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git || true
-          git fetch stable refs/tags/v6.1.128:refs/tags/v6.1.128 refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
-          git show refs/remotes/stable/linux-6.1.y:Makefile | grep '^SUBLEVEL ='
+          git config user.email "merge@local"
+          git config user.name "merge-bot"
+          git remote add common https://android.googlesource.com/kernel/common || true
+          git fetch common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
+          echo "common_sublevel=$(git show refs/remotes/common/android14-6.1:Makefile | grep '^SUBLEVEL =')"
+          echo "merge-base=$(git merge-base HEAD refs/remotes/common/android14-6.1 || echo NONE)"
+          git merge --no-edit refs/remotes/common/android14-6.1 || true
+          git ls-files -u | awk '{print $4}' | sort -u > unmerged.txt || true
+          echo "conflict_count=$(wc -l < unmerged.txt || echo 0)"
+          echo "=== unmerged ==="; cat unmerged.txt
+          CONFLICTS=$(wc -l < unmerged.txt || echo 0)
+          if [ "$CONFLICTS" = "0" ]; then
+            echo "merged_sublevel=$(git show HEAD:Makefile | grep '^SUBLEVEL =')"
+            git push origin HEAD:refs/heads/bump-android14-6.1
+            echo "pushed bump-android14-6.1"
+          else
+            echo "has conflicts, not pushing"
+          fi
 
-      - name: Apply and diagnose
-        shell: bash
-        run: |
-          set -e
-          git diff refs/tags/v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
-          echo "patch_files=$(git apply --numstat /tmp/stable.patch | wc -l)"
-          echo "makefile_in_patch=$(git apply --numstat /tmp/stable.patch | grep -c Makefile || true)"
-          git apply --3way --reject --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
-          echo "apply_error_lines=$(grep -c 'error' /tmp/apply.out || true)"
-          echo "=== apply errors head ==="; grep error /tmp/apply.out | head -30
-          echo "=== makefile diff after ==="; git diff -- Makefile | head -20
-          echo "=== sublevel now ==="; grep '^SUBLEVEL =' Makefile
-          git status --short > merge_status.txt || true
-
-      - name: Upload diag
+      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: merge-report
-          path: |
-            /tmp/apply.out
-            /tmp/stable.patch
-            merge_status.txt
+          path: unmerged.txt
           if-no-files-found: ignore
