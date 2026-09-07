@@ -22,7 +22,7 @@ jobs:
           set -e
           git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git || true
           git fetch stable refs/tags/v6.1.128:refs/tags/v6.1.128 refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
-          git show linux-6.1.y:Makefile | grep '^SUBLEVEL ='
+          git show refs/remotes/stable/linux-6.1.y:Makefile | grep '^SUBLEVEL ='
 
       - name: Apply 128..187 stable diff (3way)
         shell: bash
@@ -30,7 +30,7 @@ jobs:
           set -e
           git config user.email "merge@local"
           git config user.name "merge-bot"
-          git diff v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
+          git diff refs/tags/v6.1.128 refs/remotes/stable/linux-6.1.y > /tmp/stable.patch
           echo "patch_files=$(git apply --numstat /tmp/stable.patch | wc -l)"
           git apply --3way --whitespace=nowarn /tmp/stable.patch > /tmp/apply.out 2>&1 || true
           echo "apply_failed=$(grep -c 'error' /tmp/apply.out || true)"
