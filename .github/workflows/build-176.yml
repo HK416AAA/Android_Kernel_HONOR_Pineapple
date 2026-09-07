@@ -1,0 +1,73 @@
+name: Build Kernel 176 (google base + vendor overlay)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout vendor kernel (overlay source)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick libelf-dev liblz4-tool libssl-dev lzop rsync schedtool squashfs-tools zip zlib1g-dev dwarves
+
+      - name: Fetch google android14-6.1 (SUBLEVEL 176) tree
+        run: |
+          git remote add common https://android.googlesource.com/kernel/common || true
+          git fetch --depth=1 common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
+          git worktree add /tmp/ktree refs/remotes/common/android14-6.1
+          git -C /tmp/ktree log -1 --format='%H' ; git -C /tmp/ktree show HEAD:Makefile | grep '^SUBLEVEL ='
+
+      - name: Overlay vendor-only changes onto 176
+        shell: bash
+        run: |
+          set -e
+          # files the vendor tree changed vs google176
+          git diff --name-status refs/remotes/common/android14-6.1 HEAD > /tmp/delta.txt || true
+          while read -r st path; do
+            case "$st" in
+              A|M) mkdir -p "/tmp/ktree/$(dirname "$path")"; cp "$path" "/tmp/ktree/$path";;
+              D) rm -f "/tmp/ktree/$path";;
+            esac
+          done < /tmp/delta.txt
+          echo "overlaid_files=$(grep -cv '^D' /tmp/delta.txt || true)"
+          ls -la /tmp/ktree/arch/arm64/configs/merge_pineapple_defconfig
+
+      - name: Fetch Android 15 Clang
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/clang
+          git clone --depth=1 -b android15-release https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $GITHUB_WORKSPACE/clang
+
+      - name: Setup KernelSU (SukiSU + Susfs)
+        working-directory: /tmp/ktree
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+
+      - name: Build Kernel
+        working-directory: /tmp/ktree
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/clang-r522817/bin:$PATH
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          mkdir -p out
+          make O=out merge_pineapple_defconfig
+          make -j$(nproc) O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
+      - name: Upload Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-176
+          path: |
+            /tmp/ktree/out/arch/arm64/boot/Image
+            /tmp/ktree/out/arch/arm64/boot/Image.gz
