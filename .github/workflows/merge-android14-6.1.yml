@@ -1,0 +1,43 @@
+name: merge-android14-6.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Full checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch android14-6.1 and merge
+        shell: bash
+        run: |
+          set -e
+          git config user.email "merge@local"
+          git config user.name "merge-bot"
+          git remote add common https://android.googlesource.com/kernel/common || true
+          git fetch --depth=1 common refs/tags/android14-6.1:refs/tags/android14-6.1
+          git merge --no-edit refs/tags/android14-6.1 || true
+          git status --short > merge_status.txt
+          git diff --name-only --diff-filter=U > conflicts.txt || true
+          echo "conflict_count=$(wc -l < conflicts.txt || echo 0)"
+          echo "=== unmerged (need manual) ==="
+          cat conflicts.txt
+          echo "=== changed files top ==="
+          head -40 merge_status.txt
+
+      - name: Upload merge report
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-report
+          path: |
+            merge_status.txt
+            conflicts.txt
+          if-no-files-found: ignore
