@@ -23,8 +23,8 @@ jobs:
           git config user.email "merge@local"
           git config user.name "merge-bot"
           git remote add common https://android.googlesource.com/kernel/common || true
-          git fetch --depth=1 common refs/tags/android14-6.1:refs/tags/android14-6.1
-          git merge --no-edit refs/tags/android14-6.1 || true
+          git fetch --depth=1 common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
+          git merge --no-edit refs/remotes/common/android14-6.1 || true
           git status --short > merge_status.txt
           git diff --name-only --diff-filter=U > conflicts.txt || true
           echo "conflict_count=$(wc -l < conflicts.txt || echo 0)"
