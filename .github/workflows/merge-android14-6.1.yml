@@ -7,16 +7,16 @@ permissions:
   contents: write
 
 jobs:
-  merge:
+  bump:
     runs-on: ubuntu-24.04
-    timeout-minutes: 420
+    timeout-minutes: 240
     steps:
       - name: Full checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fetch google android14-6.1 (full) and merge
+      - name: Take google android14-6.1 (SUBLEVEL 176) as new base
         shell: bash
         run: |
           set -e
@@ -24,24 +24,10 @@ jobs:
           git config user.name "merge-bot"
           git remote add common https://android.googlesource.com/kernel/common || true
           git fetch common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
-          echo "common_sublevel=$(git show refs/remotes/common/android14-6.1:Makefile | grep '^SUBLEVEL =')"
-          echo "merge-base=$(git merge-base HEAD refs/remotes/common/android14-6.1 || echo NONE)"
-          git merge --no-edit refs/remotes/common/android14-6.1 || true
-          git ls-files -u | awk '{print $4}' | sort -u > unmerged.txt || true
-          echo "conflict_count=$(wc -l < unmerged.txt || echo 0)"
-          echo "=== unmerged ==="; cat unmerged.txt
-          CONFLICTS=$(wc -l < unmerged.txt || echo 0)
-          if [ "$CONFLICTS" = "0" ]; then
-            echo "merged_sublevel=$(git show HEAD:Makefile | grep '^SUBLEVEL =')"
-            git push origin HEAD:refs/heads/bump-android14-6.1
-            echo "pushed bump-android14-6.1"
-          else
-            echo "has conflicts, not pushing"
-          fi
-
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: merge-report
-          path: unmerged.txt
-          if-no-files-found: ignore
+          git show refs/remotes/common/android14-6.1:Makefile | grep '^SUBLEVEL ='
+          # vendor delta over the old android14-6.1 baseline was empty, so the
+          # upstream HEAD is the upgraded kernel itself.
+          git checkout -b bump-android14-6.1-176 refs/remotes/common/android14-6.1
+          echo "new_sublevel=$(grep '^SUBLEVEL =' Makefile)"
+          git push --force origin bump-android14-6.1-176
+          echo "pushed bump-android14-6.1-176"
