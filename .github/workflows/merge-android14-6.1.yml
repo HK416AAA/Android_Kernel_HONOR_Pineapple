@@ -1,4 +1,4 @@
-name: merge-android14-6.1
+name: merge-stable-6.1.y
 
 on:
   workflow_dispatch:
@@ -9,29 +9,28 @@ permissions:
 jobs:
   merge:
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 360
     steps:
       - name: Full checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fetch android14-6.1 and merge
+      - name: Fetch linux-6.1.y and merge
         shell: bash
         run: |
           set -e
           git config user.email "merge@local"
           git config user.name "merge-bot"
-          git remote add common https://android.googlesource.com/kernel/common || true
-          git fetch --depth=1 common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
-          git merge --no-edit refs/remotes/common/android14-6.1 || true
+          git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git || true
+          git fetch --depth=1 stable refs/heads/linux-6.1.y:refs/remotes/stable/linux-6.1.y
+          echo "upstream_sublevel=$(git show -s --format=%H refs/remotes/stable/linux-6.1.y) $(git show refs/remotes/stable/linux-6.1.y:Makefile | grep -E '^(SUBLEVEL|EXTRAVERSION) =' | tr '\n' ' ')"
+          git merge --no-edit refs/remotes/stable/linux-6.1.y || true
           git status --short > merge_status.txt
           git diff --name-only --diff-filter=U > conflicts.txt || true
           echo "conflict_count=$(wc -l < conflicts.txt || echo 0)"
-          echo "=== unmerged (need manual) ==="
-          cat conflicts.txt
-          echo "=== changed files top ==="
-          head -40 merge_status.txt
+          echo "=== unmerged ==="; cat conflicts.txt
+          echo "=== changed sample ==="; head -40 merge_status.txt
 
       - name: Upload merge report
         uses: actions/upload-artifact@v4
