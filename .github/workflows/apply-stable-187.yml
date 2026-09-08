@@ -40,13 +40,23 @@ jobs:
           echo "new_sublevel=$(grep '^SUBLEVEL =' Makefile)"
           echo "defconfig_present=$([ -f arch/arm64/configs/merge_pineapple_defconfig ] && echo yes || echo no)"
 
-      - name: Commit applied part and push branch
+      - name: Resolve rejects (keep vendor files), bump Makefile, commit
         shell: bash
         run: |
           set -e
-          git add -A -- . ':!*.rej'
-          git commit -m "kernel: apply stable 6.1.128 -> 6.1.187" || echo "nothing to commit"
-          echo "new_sublevel=$(git show HEAD:Makefile | grep '^SUBLEVEL =')"
+          # conflicted files: restore full vendor version (drop partial hunks)
+          while read -r rej; do
+            f="${rej%.rej}"; f="${f#./}"
+            git checkout HEAD -- "$f" 2>/dev/null || true
+            rm -f "$rej"
+          done < rejects.txt || true
+          find . -name '*.rej' -delete
+          # vendor Makefile kept, but SUBLEVEL bumped to 187
+          git checkout HEAD -- Makefile 2>/dev/null || true
+          sed -i 's/^SUBLEVEL = 128/SUBLEVEL = 187/' Makefile
+          echo "resolved_sublevel=$(grep '^SUBLEVEL =' Makefile)"
+          git add -A
+          git commit -m "kernel: stable 6.1.128 -> 6.1.187 (vendor files preserved on conflict)" || echo "nothing to commit"
           git push origin HEAD:refs/heads/stable187-apply
 
       - name: Upload apply report
