@@ -6,9 +6,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 300
+    timeout-minutes: 420
     steps:
-      - name: Checkout vendor kernel (overlay source)
+      - name: Checkout vendor kernel
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -18,27 +18,38 @@ jobs:
           sudo apt update
           sudo apt install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick libelf-dev liblz4-tool libssl-dev lzop rsync schedtool squashfs-tools zip zlib1g-dev dwarves
 
-      - name: Fetch google android14-6.1 (SUBLEVEL 176) tree
+      - name: Fetch google android14-6.1 full history
         run: |
           git remote add common https://android.googlesource.com/kernel/common || true
-          git fetch --depth=1 common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
-          git worktree add /tmp/ktree refs/remotes/common/android14-6.1
-          git -C /tmp/ktree log -1 --format='%H' ; git -C /tmp/ktree show HEAD:Makefile | grep '^SUBLEVEL ='
+          git fetch common refs/heads/android14-6.1:refs/remotes/common/android14-6.1
 
-      - name: Overlay vendor-only changes onto 176
+      - name: Locate google baseline at SUBLEVEL 128
         shell: bash
         run: |
           set -e
-          # files the vendor tree changed vs google176
-          git diff --name-status refs/remotes/common/android14-6.1 HEAD > /tmp/delta.txt || true
-          while read -r st path; do
-            case "$st" in
-              A|M) mkdir -p "/tmp/ktree/$(dirname "$path")"; cp "$path" "/tmp/ktree/$path";;
-              D) rm -f "/tmp/ktree/$path";;
-            esac
-          done < /tmp/delta.txt
-          echo "overlaid_files=$(grep -cv '^D' /tmp/delta.txt || true)"
-          ls -la /tmp/ktree/arch/arm64/configs/merge_pineapple_defconfig
+          BASE=""
+          for c in $(git rev-list refs/remotes/common/android14-6.1 -- Makefile | head -4000); do
+            s=$(git show $c:Makefile 2>/dev/null | awk '/^SUBLEVEL =/{print $3}')
+            if [ "$s" = "128" ]; then BASE=$c; break; fi
+          done
+          echo "base128=$BASE"
+          echo "$BASE" > /tmp/base128
+          git show "$BASE":Makefile | grep '^SUBLEVEL ='
+
+      - name: Build vendor-only delta and overlay onto 176
+        shell: bash
+        run: |
+          set -e
+          BASE=$(cat /tmp/base128)
+          echo "upstream176=$(git show refs/remotes/common/android14-6.1:Makefile | grep '^SUBLEVEL =')"
+          git diff "$BASE" HEAD > /tmp/vendor.patch
+          echo "vendor_patch_files=$(git apply --numstat /tmp/vendor.patch | wc -l)"
+          git worktree add /tmp/ktree refs/remotes/common/android14-6.1
+          cd /tmp/ktree
+          git apply --3way /tmp/vendor.patch 2>/tmp/vendor_apply.log || git apply --reject /tmp/vendor.patch >> /tmp/vendor_apply.log 2>&1 || true
+          grep -c 'error' /tmp/vendor_apply.log || true
+          grep '^SUBLEVEL =' Makefile
+          ls -la arch/arm64/configs/merge_pineapple_defconfig
 
       - name: Fetch Android 15 Clang
         run: |
