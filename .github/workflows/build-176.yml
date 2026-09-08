@@ -28,7 +28,7 @@ jobs:
         run: |
           set -e
           BASE=""
-          for c in $(git rev-list refs/remotes/common/android14-6.1 -- Makefile | head -4000); do
+          for c in $(git rev-list refs/remotes/common/android14-6.1 -- Makefile | head -2000); do
             s=$(git show $c:Makefile 2>/dev/null | awk '/^SUBLEVEL =/{print $3}')
             if [ "$s" = "128" ]; then BASE=$c; break; fi
           done
@@ -47,9 +47,17 @@ jobs:
           git worktree add /tmp/ktree refs/remotes/common/android14-6.1
           cd /tmp/ktree
           git apply --3way /tmp/vendor.patch 2>/tmp/vendor_apply.log || git apply --reject /tmp/vendor.patch >> /tmp/vendor_apply.log 2>&1 || true
-          grep -c 'error' /tmp/vendor_apply.log || true
-          grep '^SUBLEVEL =' Makefile
-          ls -la arch/arm64/configs/merge_pineapple_defconfig
+          echo "apply_errors=$(grep -c 'error' /tmp/vendor_apply.log || true)"
+          grep error /tmp/vendor_apply.log | head -15 || true
+          echo "new_sublevel=$(grep '^SUBLEVEL =' Makefile)"
+          if [ ! -f arch/arm64/configs/merge_pineapple_defconfig ]; then
+            echo "ERROR: merge_pineapple_defconfig missing after overlay" >&2
+            exit 1
+          fi
+          if ! grep -q '^SUBLEVEL = 176' Makefile; then
+            echo "ERROR: not on SUBLEVEL 176" >&2
+            exit 1
+          fi
 
       - name: Fetch Android 15 Clang
         run: |
