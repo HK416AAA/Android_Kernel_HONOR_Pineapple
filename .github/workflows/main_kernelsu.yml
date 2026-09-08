@@ -31,9 +31,6 @@ jobs:
       - name: Setup KernelSU
         run: curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
-      - name: Setup Susfs
-        run: curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
-      
       - name: Build Kernel
         run: |
           # 1. 设置环境变量
