@@ -44,20 +44,21 @@ jobs:
         shell: bash
         run: |
           set -e
-          # conflicted files: restore full vendor version (drop partial hunks)
+          # conflicted files are kernel core/headers: take the full upstream
+          # stable(187) version so macros/structs line up with the applied hunks.
           while read -r rej; do
             f="${rej%.rej}"; f="${f#./}"
-            git checkout HEAD -- "$f" 2>/dev/null || true
+            git show refs/remotes/stable/linux-6.1.y:"$f" > "$f" 2>/dev/null || git checkout HEAD -- "$f"
             rm -f "$rej"
           done < rejects.txt || true
           find . -name '*.rej' -delete
-          # vendor Makefile kept, but SUBLEVEL bumped to 187
-          git checkout HEAD -- Makefile 2>/dev/null || true
-          sed -i 's/^SUBLEVEL = 128/SUBLEVEL = 187/' Makefile
+          # Makefile fully from stable (SUBLEVEL 187)
+          git show refs/remotes/stable/linux-6.1.y:Makefile > Makefile
           echo "resolved_sublevel=$(grep '^SUBLEVEL =' Makefile)"
+          echo "conflict_files_now_stable=$(wc -l < rejects.txt || echo 0)"
           git add -A
           git commit -m "kernel: stable 6.1.128 -> 6.1.187 (vendor files preserved on conflict)" || echo "nothing to commit"
-          git push --force origin HEAD:refs/heads/stable187-apply
+          git push origin HEAD:refs/heads/stable187-apply
 
       - name: Upload apply report
         uses: actions/upload-artifact@v4
