@@ -57,7 +57,7 @@ jobs:
           echo "resolved_sublevel=$(grep '^SUBLEVEL =' Makefile)"
           git add -A
           git commit -m "kernel: stable 6.1.128 -> 6.1.187 (vendor files preserved on conflict)" || echo "nothing to commit"
-          git push origin HEAD:refs/heads/stable187-apply
+          git push --force origin HEAD:refs/heads/stable187-apply
 
       - name: Upload apply report
         uses: actions/upload-artifact@v4
