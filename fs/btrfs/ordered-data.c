@@ -173,9 +173,10 @@ int btrfs_add_ordered_extent(struct btrfs_inode *inode, u64 file_offset,
 	struct btrfs_ordered_extent *entry;
 	int ret;
 	u64 qgroup_rsv = 0;
+	const bool is_nocow = (flags &
+	       ((1U << BTRFS_ORDERED_NOCOW) | (1U << BTRFS_ORDERED_PREALLOC)));
 
-	if (flags &
-	    ((1 << BTRFS_ORDERED_NOCOW) | (1 << BTRFS_ORDERED_PREALLOC))) {
+	if (is_nocow) {
 		/* For nocow write, we can release the qgroup rsv right now */
 		ret = btrfs_qgroup_free_data(inode, NULL, file_offset, num_bytes, &qgroup_rsv);
 		if (ret < 0)
@@ -191,8 +192,13 @@ int btrfs_add_ordered_extent(struct btrfs_inode *inode, u64 file_offset,
 			return ret;
 	}
 	entry = kmem_cache_zalloc(btrfs_ordered_extent_cache, GFP_NOFS);
-	if (!entry)
+	if (!entry) {
+		if (!is_nocow)
+			btrfs_qgroup_free_refroot(inode->root->fs_info,
+						  btrfs_root_id(inode->root),
+						  qgroup_rsv, BTRFS_QGROUP_RSV_DATA);
 		return -ENOMEM;
+	}
 
 	entry->file_offset = file_offset;
 	entry->num_bytes = num_bytes;
@@ -271,6 +277,18 @@ void btrfs_add_ordered_sum(struct btrfs_ordered_extent *entry,
 	spin_lock_irq(&tree->lock);
 	list_add_tail(&sum->list, &entry->list);
 	spin_unlock_irq(&tree->lock);
+}
+
+void btrfs_mark_ordered_extent_truncated(struct btrfs_ordered_extent *ordered,
+					 u64 truncate_len)
+{
+	struct btrfs_inode *inode = BTRFS_I(ordered->inode);
+
+	ASSERT(truncate_len <= ordered->num_bytes);
+	spin_lock_irq(&inode->ordered_tree.lock);
+	set_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags);
+	ordered->truncated_len = min(ordered->truncated_len, truncate_len);
+	spin_unlock_irq(&inode->ordered_tree.lock);
 }
 
 static void finish_ordered_fn(struct btrfs_work *work)

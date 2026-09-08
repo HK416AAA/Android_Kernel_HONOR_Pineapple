@@ -20,8 +20,6 @@
 #include <linux/stacktrace.h>
 #include <linux/jump_label.h>
 
-#include <trace/hooks/mm.h>
-
 #define DM_MSG_PREFIX "bufio"
 
 /*
@@ -38,13 +36,6 @@
 #define DM_BUFIO_VMALLOC_PERCENT	25
 #define DM_BUFIO_WRITEBACK_RATIO	3
 #define DM_BUFIO_LOW_WATERMARK_RATIO	16
-
-#ifdef CONFIG_DM_HONOR_OPT_PARAMETER
-#define DM_BUFIO_CLIENT_BUF_COUNT_SHIFT		7 /* verity_size/IO = 1/128 */
-#define DM_BUFIO_DEFAULT_CLIENT_RETAIN_RATIO	100
-#define DM_BUFIO_DEFAULT_RECLAIM_RETAIN_RATIO	100
-#define dm_vaild_ratio_check(x) (((x) > 0) && ((x) <= 100))
-#endif
 
 /*
  * Check buffer ages in this interval (seconds)
@@ -96,10 +87,6 @@ struct dm_bufio_client {
 
 	struct list_head lru[LIST_SIZE];
 	unsigned long n_buffers[LIST_SIZE];
-#ifdef CONFIG_DM_HONOR_OPT_PARAMETER
-	unsigned int clt_retain_ratio;
-	unsigned long clt_retain_cnt;
-#endif
 
 	struct block_device *bdev;
 	unsigned int block_size;
@@ -124,11 +111,7 @@ struct dm_bufio_client {
 
 	struct list_head client_list;
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	struct shrinker *shrinker;
-#else
 	struct shrinker shrinker;
-#endif
 	struct work_struct shrink_work;
 	atomic_long_t need_shrink;
 };
@@ -245,10 +228,6 @@ static unsigned long dm_bufio_allocated_kmem_cache;
 static unsigned long dm_bufio_allocated_get_free_pages;
 static unsigned long dm_bufio_allocated_vmalloc;
 static unsigned long dm_bufio_current_allocated;
-#ifdef CONFIG_DM_HONOR_OPT_PARAMETER
-static unsigned int dm_bufio_client_retain_ratio = DM_BUFIO_DEFAULT_CLIENT_RETAIN_RATIO;
-static unsigned int dm_bufio_reclaim_retain_ratio = DM_BUFIO_DEFAULT_RECLAIM_RETAIN_RATIO;
-#endif
 
 /*----------------------------------------------------------------*/
 
@@ -644,6 +623,7 @@ static void bio_complete(struct bio *bio)
 {
 	struct dm_buffer *b = bio->bi_private;
 	blk_status_t status = bio->bi_status;
+
 	bio_uninit(bio);
 	kfree(bio);
 	b->end_io(b, status);
@@ -676,6 +656,7 @@ dmio:
 
 	do {
 		unsigned int this_step = min((unsigned int)(PAGE_SIZE - offset_in_page(ptr)), len);
+
 		if (!bio_add_page(bio, virt_to_page(ptr), this_step,
 				  offset_in_page(ptr))) {
 			bio_put(bio);
@@ -707,7 +688,7 @@ static void submit_io(struct dm_buffer *b, enum req_op op,
 {
 	unsigned int n_sectors;
 	sector_t sector;
-	unsigned int offset, end;
+	unsigned int offset, end, align;
 
 	b->end_io = end_io;
 
@@ -721,9 +702,11 @@ static void submit_io(struct dm_buffer *b, enum req_op op,
 			b->c->write_callback(b);
 		offset = b->write_start;
 		end = b->write_end;
-		offset &= -DM_BUFIO_WRITE_ALIGN;
-		end += DM_BUFIO_WRITE_ALIGN - 1;
-		end &= -DM_BUFIO_WRITE_ALIGN;
+		align = max(DM_BUFIO_WRITE_ALIGN,
+			bdev_physical_block_size(b->c->bdev));
+		offset &= -align;
+		end += align - 1;
+		end &= -align;
 		if (unlikely(end > b->c->block_size))
 			end = b->c->block_size;
 
@@ -796,6 +779,7 @@ static void __write_dirty_buffer(struct dm_buffer *b,
 static void __flush_write_list(struct list_head *write_list)
 {
 	struct blk_plug plug;
+
 	blk_start_plug(&plug);
 	while (!list_empty(write_list)) {
 		struct dm_buffer *b =
@@ -1191,6 +1175,7 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 	for (; n_blocks--; block++) {
 		int need_submit;
 		struct dm_buffer *b;
+
 		b = __bufio_new(c, block, NF_PREFETCH, &need_submit,
 				&write_list);
 		if (unlikely(!list_empty(&write_list))) {
@@ -1414,7 +1399,9 @@ int dm_bufio_issue_discard(struct dm_bufio_client *c, sector_t block, sector_t c
 	struct dm_io_region io_reg = {
 		.bdev = c->bdev,
 		.sector = block_to_sector(c, block),
-		.count = block_to_sector(c, count),
+		.count = likely(c->sectors_per_block_bits >= 0) ?
+			count << c->sectors_per_block_bits :
+			count * (c->block_size >> SECTOR_SHIFT),
 	};
 
 	BUG_ON(dm_bufio_in_request());
@@ -1475,6 +1462,7 @@ retry:
 		__link_buffer(b, new_block, LIST_DIRTY);
 	} else {
 		sector_t old_block;
+
 		wait_on_bit_lock_io(&b->state, B_WRITING,
 				    TASK_UNINTERRUPTIBLE);
 		/*
@@ -1565,6 +1553,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_get_block_size);
 sector_t dm_bufio_get_device_size(struct dm_bufio_client *c)
 {
 	sector_t s = bdev_nr_sectors(c->bdev);
+
 	if (s >= c->start)
 		s -= c->start;
 	else
@@ -1679,43 +1668,14 @@ static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
 
 static unsigned long get_retain_buffers(struct dm_bufio_client *c)
 {
-#ifdef CONFIG_DM_HONOR_OPT_PARAMETER
-	unsigned long retain_bytes			= READ_ONCE(dm_bufio_retain_bytes);
-	unsigned int client_retain_ratio	= READ_ONCE(dm_bufio_client_retain_ratio);
-	unsigned int reclaim_retain_ratio	= READ_ONCE(dm_bufio_reclaim_retain_ratio);
-	unsigned long retain_buf_cnt;
-	unsigned long count;
-
-	if (likely(c->sectors_per_block_bits >= 0))
-		retain_buf_cnt = retain_bytes >> (c->sectors_per_block_bits + SECTOR_SHIFT);
-	else
-		retain_buf_cnt = retain_bytes / c->block_size;
-
-	if ((c->clt_retain_ratio != client_retain_ratio) &&
-		dm_vaild_ratio_check(client_retain_ratio)) {
-		c->clt_retain_ratio = client_retain_ratio;
-		count = dm_bufio_get_device_size(c);
-		count >>= DM_BUFIO_CLIENT_BUF_COUNT_SHIFT;
-		c->clt_retain_cnt = count * client_retain_ratio / 100;
-	}
-	if (retain_buf_cnt < c->clt_retain_cnt)
-		retain_buf_cnt = c->clt_retain_cnt;
-
-	if (dm_vaild_ratio_check(reclaim_retain_ratio)) {
-		count = c->n_buffers[LIST_CLEAN] + c->n_buffers[LIST_DIRTY];
-		count = (count * reclaim_retain_ratio) / 100;
-		if (retain_buf_cnt < count)
-			retain_buf_cnt = count;
-	}
-	return retain_buf_cnt;
-#else
 	unsigned long retain_bytes = READ_ONCE(dm_bufio_retain_bytes);
+
 	if (likely(c->sectors_per_block_bits >= 0))
 		retain_bytes >>= c->sectors_per_block_bits + SECTOR_SHIFT;
 	else
 		retain_bytes /= c->block_size;
+
 	return retain_bytes;
-#endif
 }
 
 static void __scan(struct dm_bufio_client *c)
@@ -1737,7 +1697,8 @@ static void __scan(struct dm_bufio_client *c)
 				atomic_long_dec(&c->need_shrink);
 				freed++;
 			}
-			cond_resched();
+			if (!(static_branch_unlikely(&no_sleep_enabled) && c->no_sleep))
+				cond_resched();
 		}
 	}
 }
@@ -1754,19 +1715,8 @@ static void shrink_work(struct work_struct *w)
 static unsigned long dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 {
 	struct dm_bufio_client *c;
-	bool bypass = false;
 
-	trace_android_vh_dm_bufio_shrink_scan_bypass(
-			dm_bufio_current_allocated,
-			&bypass);
-	if (bypass)
-		return 0;
-
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	c = shrink->private_data;
-#else
 	c = container_of(shrink, struct dm_bufio_client, shrinker);
-#endif
 	atomic_long_add(sc->nr_to_scan, &c->need_shrink);
 	queue_work(dm_bufio_wq, &c->shrink_work);
 
@@ -1775,11 +1725,7 @@ static unsigned long dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink
 
 static unsigned long dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	struct dm_bufio_client *c = shrink->private_data;
-#else
 	struct dm_bufio_client *c = container_of(shrink, struct dm_bufio_client, shrinker);
-#endif
 	unsigned long count = READ_ONCE(c->n_buffers[LIST_CLEAN]) +
 			      READ_ONCE(c->n_buffers[LIST_DIRTY]);
 	unsigned long retain_target = get_retain_buffers(c);
@@ -1864,6 +1810,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 	if (block_size <= KMALLOC_MAX_SIZE &&
 	    (block_size < PAGE_SIZE || !is_power_of_2(block_size))) {
 		unsigned int align = min(1U << __ffs(block_size), (unsigned int)PAGE_SIZE);
+
 		snprintf(slab_name, sizeof slab_name, "dm_bufio_cache-%u", block_size);
 		c->slab_cache = kmem_cache_create(slab_name, block_size, align,
 						  SLAB_RECLAIM_ACCOUNT, NULL);
@@ -1896,21 +1843,6 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 	INIT_WORK(&c->shrink_work, shrink_work);
 	atomic_long_set(&c->need_shrink, 0);
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	c->shrinker = shrinker_alloc(0, "dm-bufio");
-	if (!c->shrinker) {
-		r = -ENOMEM;
-		goto bad;
-	}
-
-	c->shrinker->count_objects = dm_bufio_shrink_count;
-	c->shrinker->scan_objects = dm_bufio_shrink_scan;
-	c->shrinker->seeks = 1;
-	c->shrinker->batch = 0;
-	c->shrinker->private_data = c;
-
-	shrinker_register(c->shrinker);
-#else
 	c->shrinker.count_objects = dm_bufio_shrink_count;
 	c->shrinker.scan_objects = dm_bufio_shrink_scan;
 	c->shrinker.seeks = 1;
@@ -1919,7 +1851,6 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 			      MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
 	if (r)
 		goto bad;
-#endif
 
 	mutex_lock(&dm_bufio_clients_lock);
 	dm_bufio_client_count++;
@@ -1959,11 +1890,7 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 
 	drop_buffers(c);
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	shrinker_free(c->shrinker);
-#else
 	unregister_shrinker(&c->shrinker);
-#endif
 	flush_work(&c->shrink_work);
 
 	mutex_lock(&dm_bufio_clients_lock);
@@ -2134,14 +2061,6 @@ static void cleanup_old_buffers(void)
 {
 	unsigned long max_age_hz = get_max_age_hz();
 	struct dm_bufio_client *c;
-	bool bypass = false;
-
-	trace_android_vh_cleanup_old_buffers_bypass(
-				dm_bufio_current_allocated,
-				&max_age_hz,
-				&bypass);
-	if (bypass)
-		return;
 
 	mutex_lock(&dm_bufio_clients_lock);
 
@@ -2270,15 +2189,6 @@ MODULE_PARM_DESC(allocated_vmalloc_bytes, "Memory allocated with vmalloc");
 
 module_param_named(current_allocated_bytes, dm_bufio_current_allocated, ulong, S_IRUGO);
 MODULE_PARM_DESC(current_allocated_bytes, "Memory currently used by the cache");
-
-#ifdef CONFIG_DM_HONOR_OPT_PARAMETER
-module_param_named(client_count, dm_bufio_client_count, int, S_IRUGO);
-MODULE_PARM_DESC(client_count, "The current number of clients");
-module_param_named(client_retain_ratio, dm_bufio_client_retain_ratio, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(client_retain_ratio, "Ajust client retain ratio");
-module_param_named(reclaim_retain_ratio, dm_bufio_reclaim_retain_ratio, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(reclaim_retain_ratio, "Ajust reclaim retain ratio, 0 is disable");
-#endif
 
 MODULE_AUTHOR("Mikulas Patocka <dm-devel@redhat.com>");
 MODULE_DESCRIPTION(DM_NAME " buffered I/O library");

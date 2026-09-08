@@ -92,10 +92,6 @@ int dwc3_host_init(struct dwc3 *dwc)
 	int			ret, irq;
 	int			prop_idx = 0;
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	dev_info(dwc->dev, "%s\n", __func__);
-#endif
-
 	irq = dwc3_host_get_irq(dwc);
 	if (irq < 0)
 		return irq;
@@ -166,10 +162,7 @@ err:
 
 void dwc3_host_exit(struct dwc3 *dwc)
 {
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	dev_info(dwc->dev, "%s\n", __func__);
-#endif
-	dwc3_enable_susphy(dwc, false);
+	dwc3_enable_susphy(dwc, true);
 	platform_device_unregister(dwc->xhci);
 	dwc->xhci = NULL;
 }

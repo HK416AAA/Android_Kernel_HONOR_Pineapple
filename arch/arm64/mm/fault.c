@@ -25,7 +25,6 @@
 #include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/hugetlb.h>
-#include <linux/gfp_types.h>
 
 #include <asm/acpi.h>
 #include <asm/bug.h>
@@ -43,13 +42,6 @@
 #include <asm/system_misc.h>
 #include <asm/tlbflush.h>
 #include <asm/traps.h>
-#include <asm/virt.h>
-
-#include <trace/hooks/fault.h>
-
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-#include <linux/rainbow_reason.h>
-#endif
 
 struct fault_info {
 	int	(*fn)(unsigned long far, unsigned long esr,
@@ -266,15 +258,6 @@ static inline bool is_el1_permission_fault(unsigned long addr, unsigned long esr
 	return false;
 }
 
-static bool is_pkvm_stage2_abort(unsigned int esr)
-{
-	/*
-	 * S1PTW should only ever be set in ESR_EL1 if the pkvm hypervisor
-	 * injected a stage-2 abort -- see host_inject_abort().
-	 */
-	return is_pkvm_initialized() && (esr & ESR_ELx_S1PTW);
-}
-
 static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 							unsigned long esr,
 							struct pt_regs *regs)
@@ -284,9 +267,6 @@ static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 
 	if (!is_el1_data_abort(esr) ||
 	    (esr & ESR_ELx_FSC_TYPE) != ESR_ELx_FSC_FAULT)
-		return false;
-
-	if (is_pkvm_stage2_abort(esr))
 		return false;
 
 	local_irq_save(flags);
@@ -315,16 +295,11 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 {
 	bust_spinlocks(1);
 
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-	rb_sreason_set("unknown_addr");
-#endif
-
 	pr_alert("Unable to handle kernel %s at virtual address %016lx\n", msg,
 		 addr);
 
 	kasan_non_canonical_hook(addr);
 
-	trace_android_rvh_die_kernel_fault(msg, addr, esr, regs);
 	mem_abort_decode(esr);
 
 	show_pte(addr);
@@ -407,41 +382,20 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 	}
 
 	if (is_el1_permission_fault(addr, esr, regs)) {
-		if (esr & ESR_ELx_WNR) {
+		if (esr & ESR_ELx_WNR)
 			msg = "write to read-only memory";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-			rb_sreason_set("read-only");
-#endif
-		} else if (is_el1_instruction_abort(esr)) {
+		else if (is_el1_instruction_abort(esr))
 			msg = "execute from non-executable memory";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-			rb_sreason_set("non-executable");
-#endif
-		} else {
+		else
 			msg = "read from unreadable memory";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-			rb_sreason_set("read_unreadable");
-#endif
-		}
 	} else if (addr < PAGE_SIZE) {
 		msg = "NULL pointer dereference";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-		rb_sreason_set("null_pointer");
-#endif
-	} else if (is_pkvm_stage2_abort(esr)) {
-		msg = "access to hypervisor-protected memory";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-		rb_sreason_set("hyp-protected");
-#endif
 	} else {
 		if (is_translation_fault(esr) &&
 		    kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
 			return;
 
 		msg = "paging request";
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-		rb_sreason_set("page_request");
-#endif
 	}
 
 	if (efi_runtime_fixup_exception(regs, msg))
@@ -579,10 +533,6 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	 */
 	if (faulthandler_disabled() || !mm)
 		goto no_context;
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-	if (!user_mode(regs) && irqs_disabled())
-		goto no_context;
-#endif
 
 	if (user_mode(regs))
 		mm_flags |= FAULT_FLAG_USER;
@@ -621,45 +571,7 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 					 addr, esr, regs);
 	}
 
-	if (is_pkvm_stage2_abort(esr)) {
-		if (!user_mode(regs))
-			goto no_context;
-		arm64_force_sig_fault(SIGSEGV, SEGV_ACCERR, far, "stage-2 fault");
-		return 0;
-	}
-
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
-
-	if (!(mm_flags & FAULT_FLAG_USER))
-		goto lock_mmap;
-
-	vma = lock_vma_under_rcu(mm, addr);
-	if (!vma)
-		goto lock_mmap;
-
-	if (!(vma->vm_flags & vm_flags)) {
-		vma_end_read(vma);
-		goto lock_mmap;
-	}
-	fault = handle_mm_fault(vma, addr, mm_flags | FAULT_FLAG_VMA_LOCK, regs);
-	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
-		vma_end_read(vma);
-
-	if (!(fault & VM_FAULT_RETRY)) {
-		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
-		goto done;
-	}
-	count_vm_vma_lock_event(VMA_LOCK_RETRY);
-	if (fault & VM_FAULT_MAJOR)
-		mm_flags |= FAULT_FLAG_TRIED;
-
-	/* Quick path to respond to signals */
-	if (fault_signal_pending(fault, regs)) {
-		if (!user_mode(regs))
-			goto no_context;
-		return 0;
-	}
-lock_mmap:
 
 retry:
 	vma = lock_mm_and_find_vma(mm, addr, regs);
@@ -745,55 +657,6 @@ no_context:
 	return 0;
 }
 
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-/*
- * Check whether a kernel address is valid.
- */
-int kern_addr_valid(unsigned long addr)
-{
-	pgd_t *pgdp;
-	p4d_t *p4dp;
-	pud_t *pudp, pud;
-	pmd_t *pmdp, pmd;
-	pte_t *ptep, pte;
-
-	addr = arch_kasan_reset_tag(addr);
-	if ((((long)addr) >> VA_BITS) != -1UL)
-		return 0;
-
-	pgdp = pgd_offset_k(addr);
-	if (pgd_none(READ_ONCE(*pgdp)))
-		return 0;
-
-	p4dp = p4d_offset(pgdp, addr);
-	if (p4d_none(READ_ONCE(*p4dp)))
-		return 0;
-
-	pudp = pud_offset(p4dp, addr);
-	pud = READ_ONCE(*pudp);
-	if (pud_none(pud))
-		return 0;
-
-	if (pud_sect(pud))
-		return pfn_valid(pud_pfn(pud));
-
-	pmdp = pmd_offset(pudp, addr);
-	pmd = READ_ONCE(*pmdp);
-	if (pmd_none(pmd))
-		return 0;
-
-	if (pmd_sect(pmd))
-		return pfn_valid(pmd_pfn(pmd));
-
-	ptep = pte_offset_kernel(pmdp, addr);
-	pte = READ_ONCE(*ptep);
-	if (pte_none(pte))
-		return 0;
-
-	return pfn_valid(pte_pfn(pte));
-}
-#endif
-
 static int __kprobes do_translation_fault(unsigned long far,
 					  unsigned long esr,
 					  struct pt_regs *regs)
@@ -803,17 +666,6 @@ static int __kprobes do_translation_fault(unsigned long far,
 	if (is_ttbr0_addr(addr))
 		return do_page_fault(far, esr, regs);
 
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-	if (!user_mode(regs) &&
-		kern_addr_valid((unsigned long)current) &&
-		object_is_on_stack((void *)addr)) {
-		pr_debug("kernel fault address 0x%lx esr 0x%lx stack %p\n",
-				addr, esr, current->stack);
-		if (!vmap_stack_alloc_page_atomic(current, addr)) {
-			return 0;
-		}
-	}
-#endif
 	do_bad_area(far, esr, regs);
 	return 0;
 }
@@ -837,11 +689,6 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf;
 	unsigned long siaddr;
-	bool can_fixup = false;
-
-	trace_android_vh_try_fixup_sea(far, esr, regs, &can_fixup);
-	if (can_fixup && fixup_exception(regs))
-		return 0;
 
 	inf = esr_to_fault_info(esr);
 
@@ -863,11 +710,7 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 		 */
 		siaddr  = untagged_addr(far);
 	}
-	trace_android_rvh_do_sea(siaddr, esr, regs);
-
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-	rb_sreason_set("SEA");
-#endif
+	add_taint(TAINT_MACHINE_CHECK, LOCKDEP_STILL_OK);
 	arm64_notify_die(inf->name, regs, inf->sig, inf->code, siaddr, esr);
 
 	return 0;
@@ -961,14 +804,9 @@ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 	if (!inf->fn(far, esr, regs))
 		return;
 
-	if (!user_mode(regs)) {
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-		rb_sreason_set("unhandle_fault");
-		rb_attach_info_set("Unhandled_fault_%s", inf->name);
-#endif
-
+	if (!user_mode(regs))
 		die_kernel_fault(inf->name, addr, esr, regs);
-	}
+
 	/*
 	 * At this point we have an unrecognized fault type whose tag bits may
 	 * have been defined as UNKNOWN. Therefore we only expose the untagged
@@ -980,12 +818,6 @@ NOKPROBE_SYMBOL(do_mem_abort);
 
 void do_sp_pc_abort(unsigned long addr, unsigned long esr, struct pt_regs *regs)
 {
-	trace_android_rvh_do_sp_pc_abort(addr, esr, regs);
-
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-	if (!user_mode(regs))
-		rb_sreason_set("sp_pc_abort");
-#endif
 	arm64_notify_die("SP/PC alignment exception", regs, SIGBUS, BUS_ADRALN,
 			 addr, esr);
 }
@@ -1056,10 +888,6 @@ void do_debug_exception(unsigned long addr_if_watchpoint, unsigned long esr,
 		arm64_apply_bp_hardening();
 
 	if (inf->fn(addr_if_watchpoint, esr, regs)) {
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-		if (!user_mode(regs))
-			rb_sreason_set("debug_exception");
-#endif
 		arm64_notify_die(inf->name, regs, inf->sig, inf->code, pc, esr);
 	}
 
@@ -1073,7 +901,7 @@ NOKPROBE_SYMBOL(do_debug_exception);
 struct page *alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
 						unsigned long vaddr)
 {
-	gfp_t flags = GFP_HIGHUSER_MOVABLE | __GFP_ZERO | __GFP_CMA;
+	gfp_t flags = GFP_HIGHUSER_MOVABLE | __GFP_ZERO;
 
 	/*
 	 * If the page is mapped with PROT_MTE, initialise the tags at the

@@ -129,25 +129,35 @@ void io_readv_writev_cleanup(struct io_kiocb *req)
 	kfree(io->free_iovec);
 }
 
-static inline void io_rw_done(struct kiocb *kiocb, ssize_t ret)
+static inline ssize_t io_fixup_restart_res(ssize_t ret)
 {
 	switch (ret) {
-	case -EIOCBQUEUED:
-		break;
 	case -ERESTARTSYS:
 	case -ERESTARTNOINTR:
 	case -ERESTARTNOHAND:
 	case -ERESTART_RESTARTBLOCK:
 		/*
 		 * We can't just restart the syscall, since previously
-		 * submitted sqes may already be in progress. Just fail this
-		 * IO with EINTR.
+		 * submitted sqes may already be in progress. Just fail
+		 * this IO with EINTR.
 		 */
-		ret = -EINTR;
-		fallthrough;
+		return -EINTR;
 	default:
-		kiocb->ki_complete(kiocb, ret);
+		return ret;
 	}
+}
+
+static inline void io_rw_done(struct kiocb *kiocb, ssize_t ret)
+{
+	/* IO was queued async, completion will happen later */
+	if (ret == -EIOCBQUEUED)
+		return;
+
+	/* transform internal restart error codes */
+	if (unlikely(ret < 0))
+		ret = io_fixup_restart_res(ret);
+
+	kiocb->ki_complete(kiocb, ret);
 }
 
 static inline loff_t *io_kiocb_update_pos(struct io_kiocb *req)
@@ -772,6 +782,8 @@ static int __io_read(struct io_kiocb *req, unsigned int issue_flags)
 			goto done;
 		ret = 0;
 	} else if (ret == -EIOCBQUEUED) {
+		req->flags |= REQ_F_PARTIAL_IO;
+		io_kbuf_recycle(req, issue_flags);
 		if (iovec)
 			kfree(iovec);
 		return IOU_ISSUE_SKIP_COMPLETE;
@@ -794,6 +806,9 @@ static int __io_read(struct io_kiocb *req, unsigned int issue_flags)
 		ret = ret > 0 ? ret : ret2;
 		goto done;
 	}
+
+	req->flags |= REQ_F_PARTIAL_IO;
+	io_kbuf_recycle(req, issue_flags);
 
 	io = req->async_data;
 	s = &io->s;
@@ -849,7 +864,7 @@ int io_read(struct io_kiocb *req, unsigned int issue_flags)
 	if (ret >= 0)
 		return kiocb_done(req, ret, issue_flags);
 
-	return ret;
+	return io_fixup_restart_res(ret);
 }
 
 static bool io_kiocb_start_write(struct io_kiocb *req, struct kiocb *kiocb)
@@ -934,6 +949,11 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		ret2 = loop_rw_iter(WRITE, rw, &s->iter);
 	else
 		ret2 = -EINVAL;
+
+	if (ret2 == -EIOCBQUEUED) {
+		req->flags |= REQ_F_PARTIAL_IO;
+		io_kbuf_recycle(req, issue_flags);
+	}
 
 	if (req->flags & REQ_F_REISSUE) {
 		req->flags &= ~REQ_F_REISSUE;

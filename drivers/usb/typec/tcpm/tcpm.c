@@ -31,13 +31,11 @@
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec_altmode.h>
 
-#include <trace/hooks/typec.h>
 #include <uapi/linux/sched/types.h>
 
 #define FOREACH_STATE(S)			\
 	S(INVALID_STATE),			\
 	S(TOGGLING),			\
-	S(CHECK_CONTAMINANT),			\
 	S(SRC_UNATTACHED),			\
 	S(SRC_ATTACH_WAIT),			\
 	S(SRC_ATTACHED),			\
@@ -251,7 +249,6 @@ enum frs_typec_current {
 #define TCPM_RESET_EVENT	BIT(2)
 #define TCPM_FRS_EVENT		BIT(3)
 #define TCPM_SOURCING_VBUS	BIT(4)
-#define TCPM_PORT_CLEAN		BIT(5)
 
 #define LOG_BUFFER_ENTRIES	1024
 #define LOG_BUFFER_ENTRY_SIZE	128
@@ -295,15 +292,6 @@ struct pd_pps_data {
 	u32 req_op_curr;
 	bool supported;
 	bool active;
-};
-
-struct pd_data {
-	struct usb_power_delivery *pd;
-	struct usb_power_delivery_capabilities *source_cap;
-	struct usb_power_delivery_capabilities_desc source_desc;
-	struct usb_power_delivery_capabilities *sink_cap;
-	struct usb_power_delivery_capabilities_desc sink_desc;
-	unsigned int operating_snk_mw;
 };
 
 struct tcpm_port {
@@ -407,14 +395,12 @@ struct tcpm_port {
 	unsigned int rx_msgid;
 
 	/* USB PD objects */
-	struct usb_power_delivery **pds;
-	struct pd_data **pd_list;
+	struct usb_power_delivery *pd;
 	struct usb_power_delivery_capabilities *port_source_caps;
 	struct usb_power_delivery_capabilities *port_sink_caps;
 	struct usb_power_delivery *partner_pd;
 	struct usb_power_delivery_capabilities *partner_source_caps;
 	struct usb_power_delivery_capabilities *partner_sink_caps;
-	struct usb_power_delivery *selected_pd;
 
 	/* Partner capabilities/requests */
 	u32 sink_request;
@@ -424,7 +410,6 @@ struct tcpm_port {
 	unsigned int nr_sink_caps;
 
 	/* Local capabilities */
-	unsigned int pd_count;
 	u32 src_pdo[PDO_MAX_OBJECTS];
 	unsigned int nr_src_pdo;
 	u32 snk_pdo[PDO_MAX_OBJECTS];
@@ -498,13 +483,6 @@ struct tcpm_port {
 	 * SNK_READY for non-pd link.
 	 */
 	bool slow_charger_loop;
-
-	/*
-	 * When true indicates that the lower level drivers indicate potential presence
-	 * of contaminant in the connector pins based on the tcpm state machine
-	 * transitions.
-	 */
-	bool potential_contaminant;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *dentry;
 	struct mutex logbuffer_lock;	/* log buffer access lock */
@@ -530,9 +508,9 @@ static const char * const pd_rev[] = {
 	((cc) == TYPEC_CC_RP_DEF || (cc) == TYPEC_CC_RP_1_5 || \
 	 (cc) == TYPEC_CC_RP_3_0)
 
-/* As long as cc is pulled up, we can consider it as sink. */
 #define tcpm_port_is_sink(port) \
-	(tcpm_cc_is_sink((port)->cc1) || tcpm_cc_is_sink((port)->cc2))
+	((tcpm_cc_is_sink((port)->cc1) && !tcpm_cc_is_sink((port)->cc2)) || \
+	 (tcpm_cc_is_sink((port)->cc2) && !tcpm_cc_is_sink((port)->cc1)))
 
 #define tcpm_cc_is_source(cc) ((cc) == TYPEC_CC_RD)
 #define tcpm_cc_is_audio(cc) ((cc) == TYPEC_CC_RA)
@@ -619,7 +597,6 @@ static void _tcpm_log(struct tcpm_port *port, const char *fmt, va_list args)
 	char tmpbuffer[LOG_BUFFER_ENTRY_SIZE];
 	u64 ts_nsec = local_clock();
 	unsigned long rem_nsec;
-	bool bypass_log = false;
 
 	mutex_lock(&port->logbuffer_lock);
 	if (!port->logbuffer[port->logbuffer_head]) {
@@ -632,9 +609,6 @@ static void _tcpm_log(struct tcpm_port *port, const char *fmt, va_list args)
 	}
 
 	vsnprintf(tmpbuffer, sizeof(tmpbuffer), fmt, args);
-	trace_android_vh_typec_tcpm_log(tmpbuffer, &bypass_log);
-	if (bypass_log)
-		goto abort;
 
 	if (tcpm_log_full(port)) {
 		port->logbuffer_head = max(port->logbuffer_head - 1, 0);
@@ -673,7 +647,7 @@ static void tcpm_log(struct tcpm_port *port, const char *fmt, ...)
 	/* Do not log while disconnected and unattached */
 	if (tcpm_port_is_disconnected(port) &&
 	    (port->state == SRC_UNATTACHED || port->state == SNK_UNATTACHED ||
-	     port->state == TOGGLING || port->state == CHECK_CONTAMINANT))
+	     port->state == TOGGLING))
 		return;
 
 	va_start(args, fmt);
@@ -1058,7 +1032,7 @@ static int tcpm_set_attached_state(struct tcpm_port *port, bool attached)
 				     port->data_role);
 }
 
-static int tcpm_set_roles(struct tcpm_port *port, bool attached,
+static int tcpm_set_roles(struct tcpm_port *port, bool attached, int state,
 			  enum typec_role role, enum typec_data_role data)
 {
 	enum typec_orientation orientation;
@@ -1095,7 +1069,7 @@ static int tcpm_set_roles(struct tcpm_port *port, bool attached,
 		}
 	}
 
-	ret = tcpm_mux_set(port, TYPEC_STATE_USB, usb_role, orientation);
+	ret = tcpm_mux_set(port, state, usb_role, orientation);
 	if (ret < 0)
 		return ret;
 
@@ -1489,9 +1463,6 @@ static void tcpm_queue_vdm(struct tcpm_port *port, const u32 header,
 static void tcpm_queue_vdm_unlocked(struct tcpm_port *port, const u32 header,
 				    const u32 *data, int cnt)
 {
-	if (port->state != SRC_READY && port->state != SNK_READY)
-		return;
-
 	mutex_lock(&port->lock);
 	tcpm_queue_vdm(port, header, data, cnt);
 	mutex_unlock(&port->lock);
@@ -1572,6 +1543,11 @@ static void svdm_consume_modes(struct tcpm_port *port, const u32 *p, int cnt)
 
 	if (pmdata->altmodes >= ARRAY_SIZE(port->partner_altmode)) {
 		/* Already logged in svdm_consume_svids() */
+		return;
+	}
+
+	if (pmdata->svid_index < 0 || pmdata->svid_index >= pmdata->nsvids) {
+		tcpm_log(port, "Invalid SVID index %d", pmdata->svid_index);
 		return;
 	}
 
@@ -1907,7 +1883,8 @@ static void tcpm_handle_vdm_request(struct tcpm_port *port,
 			}
 			break;
 		case ADEV_ATTENTION:
-			typec_altmode_attention(adev, p[1]);
+			if (typec_altmode_attention(adev, p[1]))
+				tcpm_log(port, "typec_altmode_attention no port partner altmode");
 			break;
 		}
 	}
@@ -2254,7 +2231,7 @@ static int tcpm_altmode_enter(struct typec_altmode *altmode, u32 *vdo)
 	if (svdm_version < 0)
 		return svdm_version;
 
-	header = VDO(altmode->svid, vdo ? 2 : 1, svdm_version, CMD_ENTER_MODE);
+	header = VDO(altmode->svid, 1, svdm_version, CMD_ENTER_MODE);
 	header |= VDO_OPOS(altmode->mode);
 
 	tcpm_queue_vdm_unlocked(port, header, vdo, vdo ? 1 : 0);
@@ -2342,18 +2319,14 @@ static int tcpm_set_auto_vbus_discharge_threshold(struct tcpm_port *port,
 						  enum typec_pwr_opmode mode, bool pps_active,
 						  u32 requested_vbus_voltage)
 {
-	u32 voltage;
 	int ret;
 
 	if (!port->tcpc->set_auto_vbus_discharge_threshold)
 		return 0;
 
-	if (mode == TYPEC_PWR_MODE_PD && pps_active)
-		voltage = port->pps_data.min_volt;
-	else
-		voltage = requested_vbus_voltage;
-
-	ret = port->tcpc->set_auto_vbus_discharge_threshold(port->tcpc, mode, pps_active, voltage);
+	ret = port->tcpc->set_auto_vbus_discharge_threshold(port->tcpc, mode, pps_active,
+							    requested_vbus_voltage,
+							    port->pps_data.min_volt);
 	tcpm_log_force(port,
 		       "set_auto_vbus_discharge_threshold mode:%d pps_active:%c vbus:%u pps_apdo_min_volt:%u ret:%d",
 		       mode, pps_active ? 'y' : 'n', requested_vbus_voltage,
@@ -2508,8 +2481,7 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 				   port->nr_source_caps);
 
 		tcpm_register_source_caps(port);
-		trace_android_vh_typec_store_partner_src_caps(&port->nr_source_caps,
-							      &port->source_caps);
+
 		/*
 		 * Adjust revision in subsequent message headers, as required,
 		 * to comply with 6.2.1.1.5 of the USB PD 3.0 spec. We don't
@@ -2885,7 +2857,7 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 					   PD_MSG_CTRL_NOT_SUPP,
 					   NONE_AMS);
 		} else {
-			if (port->send_discover && port->negotiated_rev < PD_REV30) {
+			if (port->send_discover) {
 				tcpm_queue_message(port, PD_MSG_CTRL_WAIT);
 				break;
 			}
@@ -2901,7 +2873,7 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 					   PD_MSG_CTRL_NOT_SUPP,
 					   NONE_AMS);
 		} else {
-			if (port->send_discover && port->negotiated_rev < PD_REV30) {
+			if (port->send_discover) {
 				tcpm_queue_message(port, PD_MSG_CTRL_WAIT);
 				break;
 			}
@@ -2910,7 +2882,7 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 		}
 		break;
 	case PD_CTRL_VCONN_SWAP:
-		if (port->send_discover && port->negotiated_rev < PD_REV30) {
+		if (port->send_discover) {
 			tcpm_queue_message(port, PD_MSG_CTRL_WAIT);
 			break;
 		}
@@ -3302,12 +3274,23 @@ static int tcpm_pd_select_pdo(struct tcpm_port *port, int *sink_pdo,
 	return ret;
 }
 
+#define min_pps_apdo_current(x, y)	\
+	min(pdo_pps_apdo_max_current(x), pdo_pps_apdo_max_current(y))
+
 static unsigned int tcpm_pd_select_pps_apdo(struct tcpm_port *port)
 {
-	unsigned int i, src_ma, max_temp_mw = 0, max_op_ma, op_mw;
-	unsigned int src_pdo = 0;
-	u32 pdo, src;
+	unsigned int i, j, max_mw = 0, max_mv = 0;
+	unsigned int min_src_mv, max_src_mv, src_ma, src_mw;
+	unsigned int min_snk_mv, max_snk_mv;
+	unsigned int max_op_mv;
+	u32 pdo, src, snk;
+	unsigned int src_pdo = 0, snk_pdo = 0;
 
+	/*
+	 * Select the source PPS APDO providing the most power while staying
+	 * within the board's limits. We skip the first PDO as this is always
+	 * 5V 3A.
+	 */
 	for (i = 1; i < port->nr_source_caps; ++i) {
 		pdo = port->source_caps[i];
 
@@ -3318,17 +3301,54 @@ static unsigned int tcpm_pd_select_pps_apdo(struct tcpm_port *port)
 				continue;
 			}
 
-			if (port->pps_data.req_out_volt > pdo_pps_apdo_max_voltage(pdo) ||
-			    port->pps_data.req_out_volt < pdo_pps_apdo_min_voltage(pdo))
-				continue;
-
+			min_src_mv = pdo_pps_apdo_min_voltage(pdo);
+			max_src_mv = pdo_pps_apdo_max_voltage(pdo);
 			src_ma = pdo_pps_apdo_max_current(pdo);
-			max_op_ma = min(src_ma, port->pps_data.req_op_curr);
-			op_mw = max_op_ma * port->pps_data.req_out_volt / 1000;
-			if (op_mw > max_temp_mw) {
-				src_pdo = i;
-				max_temp_mw = op_mw;
+			src_mw = (src_ma * max_src_mv) / 1000;
+
+			/*
+			 * Now search through the sink PDOs to find a matching
+			 * PPS APDO. Again skip the first sink PDO as this will
+			 * always be 5V 3A.
+			 */
+			for (j = 1; j < port->nr_snk_pdo; j++) {
+				pdo = port->snk_pdo[j];
+
+				switch (pdo_type(pdo)) {
+				case PDO_TYPE_APDO:
+					if (pdo_apdo_type(pdo) != APDO_TYPE_PPS) {
+						tcpm_log(port,
+							 "Not PPS APDO (sink), ignoring");
+						continue;
+					}
+
+					min_snk_mv =
+						pdo_pps_apdo_min_voltage(pdo);
+					max_snk_mv =
+						pdo_pps_apdo_max_voltage(pdo);
+					break;
+				default:
+					tcpm_log(port,
+						 "Not APDO type (sink), ignoring");
+					continue;
+				}
+
+				if (min_src_mv <= max_snk_mv &&
+				    max_src_mv >= min_snk_mv) {
+					max_op_mv = min(max_src_mv, max_snk_mv);
+					src_mw = (max_op_mv * src_ma) / 1000;
+					/* Prefer higher voltages if available */
+					if ((src_mw == max_mw &&
+					     max_op_mv > max_mv) ||
+					    src_mw > max_mw) {
+						src_pdo = i;
+						snk_pdo = j;
+						max_mw = src_mw;
+						max_mv = max_op_mv;
+					}
+				}
 			}
+
 			break;
 		default:
 			tcpm_log(port, "Not APDO type (source), ignoring");
@@ -3338,10 +3358,16 @@ static unsigned int tcpm_pd_select_pps_apdo(struct tcpm_port *port)
 
 	if (src_pdo) {
 		src = port->source_caps[src_pdo];
+		snk = port->snk_pdo[snk_pdo];
 
-		port->pps_data.req_min_volt = pdo_pps_apdo_min_voltage(src);
-		port->pps_data.req_max_volt = pdo_pps_apdo_max_voltage(src);
-		port->pps_data.req_max_curr = pdo_pps_apdo_max_current(src);
+		port->pps_data.req_min_volt = max(pdo_pps_apdo_min_voltage(src),
+						  pdo_pps_apdo_min_voltage(snk));
+		port->pps_data.req_max_volt = min(pdo_pps_apdo_max_voltage(src),
+						  pdo_pps_apdo_max_voltage(snk));
+		port->pps_data.req_max_curr = min_pps_apdo_current(src, snk);
+		port->pps_data.req_out_volt = min(port->pps_data.req_max_volt,
+						  max(port->pps_data.req_min_volt,
+						      port->pps_data.req_out_volt));
 		port->pps_data.req_op_curr = min(port->pps_data.req_max_curr,
 						 port->pps_data.req_op_curr);
 	}
@@ -3459,16 +3485,32 @@ static int tcpm_pd_send_request(struct tcpm_port *port)
 static int tcpm_pd_build_pps_request(struct tcpm_port *port, u32 *rdo)
 {
 	unsigned int out_mv, op_ma, op_mw, max_mv, max_ma, flags;
+	enum pd_pdo_type type;
 	unsigned int src_pdo_index;
+	u32 pdo;
 
 	src_pdo_index = tcpm_pd_select_pps_apdo(port);
 	if (!src_pdo_index)
 		return -EOPNOTSUPP;
 
-	max_mv = port->pps_data.req_max_volt;
-	max_ma = port->pps_data.req_max_curr;
-	out_mv = port->pps_data.req_out_volt;
-	op_ma = port->pps_data.req_op_curr;
+	pdo = port->source_caps[src_pdo_index];
+	type = pdo_type(pdo);
+
+	switch (type) {
+	case PDO_TYPE_APDO:
+		if (pdo_apdo_type(pdo) != APDO_TYPE_PPS) {
+			tcpm_log(port, "Invalid APDO selected!");
+			return -EINVAL;
+		}
+		max_mv = port->pps_data.req_max_volt;
+		max_ma = port->pps_data.req_max_curr;
+		out_mv = port->pps_data.req_out_volt;
+		op_ma = port->pps_data.req_op_curr;
+		break;
+	default:
+		tcpm_log(port, "Invalid PDO selected!");
+		return -EINVAL;
+	}
 
 	flags = RDO_USB_COMM | RDO_NO_SUSPEND;
 
@@ -3649,16 +3691,6 @@ static int tcpm_src_attach(struct tcpm_port *port)
 
 	tcpm_enable_auto_vbus_discharge(port, true);
 
-	ret = tcpm_set_roles(port, true, TYPEC_SOURCE, tcpm_data_role_for_source(port));
-	if (ret < 0)
-		return ret;
-
-	if (port->pd_supported) {
-		ret = port->tcpc->set_pd_rx(port->tcpc, true);
-		if (ret < 0)
-			goto out_disable_mux;
-	}
-
 	/*
 	 * USB Type-C specification, version 1.2,
 	 * chapter 4.5.2.2.8.1 (Attached.SRC Requirements)
@@ -3668,12 +3700,23 @@ static int tcpm_src_attach(struct tcpm_port *port)
 	    (polarity == TYPEC_POLARITY_CC2 && port->cc1 == TYPEC_CC_RA)) {
 		ret = tcpm_set_vconn(port, true);
 		if (ret < 0)
-			goto out_disable_pd;
+			return ret;
 	}
 
 	ret = tcpm_set_vbus(port, true);
 	if (ret < 0)
 		goto out_disable_vconn;
+
+	ret = tcpm_set_roles(port, true, TYPEC_STATE_USB, TYPEC_SOURCE,
+			     tcpm_data_role_for_source(port));
+	if (ret < 0)
+		goto out_disable_vbus;
+
+	if (port->pd_supported) {
+		ret = port->tcpc->set_pd_rx(port->tcpc, true);
+		if (ret < 0)
+			goto out_disable_mux;
+	}
 
 	port->pd_capable = false;
 
@@ -3684,14 +3727,14 @@ static int tcpm_src_attach(struct tcpm_port *port)
 
 	return 0;
 
-out_disable_vconn:
-	tcpm_set_vconn(port, false);
-out_disable_pd:
-	if (port->pd_supported)
-		port->tcpc->set_pd_rx(port->tcpc, false);
 out_disable_mux:
 	tcpm_mux_set(port, TYPEC_STATE_SAFE, USB_ROLE_NONE,
 		     TYPEC_ORIENTATION_NONE);
+out_disable_vbus:
+	tcpm_set_vbus(port, false);
+out_disable_vconn:
+	tcpm_set_vconn(port, false);
+
 	return ret;
 }
 
@@ -3807,7 +3850,8 @@ static int tcpm_snk_attach(struct tcpm_port *port)
 
 	tcpm_enable_auto_vbus_discharge(port, true);
 
-	ret = tcpm_set_roles(port, true, TYPEC_SINK, tcpm_data_role_for_sink(port));
+	ret = tcpm_set_roles(port, true, TYPEC_STATE_USB,
+			     TYPEC_SINK, tcpm_data_role_for_sink(port));
 	if (ret < 0)
 		return ret;
 
@@ -3829,12 +3873,24 @@ static void tcpm_snk_detach(struct tcpm_port *port)
 static int tcpm_acc_attach(struct tcpm_port *port)
 {
 	int ret;
+	enum typec_role role;
+	enum typec_data_role data;
+	int state = TYPEC_STATE_USB;
 
 	if (port->attached)
 		return 0;
 
-	ret = tcpm_set_roles(port, true, TYPEC_SOURCE,
-			     tcpm_data_role_for_source(port));
+	role = tcpm_port_is_sink(port) ? TYPEC_SINK : TYPEC_SOURCE;
+	data = tcpm_port_is_sink(port) ? tcpm_data_role_for_sink(port)
+				       : tcpm_data_role_for_source(port);
+
+	if (tcpm_port_is_audio(port))
+		state = TYPEC_MODE_AUDIO;
+
+	if (tcpm_port_is_debug(port))
+		state = TYPEC_MODE_DEBUG;
+
+	ret = tcpm_set_roles(port, true, state, role, data);
 	if (ret < 0)
 		return ret;
 
@@ -3946,34 +4002,18 @@ static void run_state_machine(struct tcpm_port *port)
 {
 	int ret;
 	enum typec_pwr_opmode opmode;
-	unsigned int msecs, timer_val_msecs;
+	unsigned int msecs;
 	enum tcpm_state upcoming_state;
-	const char *state_name;
-
-	if (port->tcpc->check_contaminant && port->state != CHECK_CONTAMINANT)
-		port->potential_contaminant = ((port->enter_state == SRC_ATTACH_WAIT &&
-						port->state == SRC_UNATTACHED) ||
-					       (port->enter_state == SNK_ATTACH_WAIT &&
-						port->state == SNK_UNATTACHED) ||
-					       (port->enter_state == SNK_DEBOUNCED &&
-						port->state == SNK_UNATTACHED));
 
 	port->enter_state = port->state;
 	switch (port->state) {
 	case TOGGLING:
-		break;
-	case CHECK_CONTAMINANT:
-		port->tcpc->check_contaminant(port->tcpc);
 		break;
 	/* SRC states */
 	case SRC_UNATTACHED:
 		if (!port->non_pd_role_swap)
 			tcpm_swap_complete(port, -ENOTCONN);
 		tcpm_src_detach(port);
-		if (port->potential_contaminant) {
-			tcpm_set_state(port, CHECK_CONTAMINANT, 0);
-			break;
-		}
 		if (tcpm_start_toggling(port, tcpm_rp_cc(port))) {
 			tcpm_set_state(port, TOGGLING, 0);
 			break;
@@ -3983,20 +4023,17 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state(port, SNK_UNATTACHED, PD_T_DRP_SNK);
 		break;
 	case SRC_ATTACH_WAIT:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SRC_ATTACH_WAIT],
-						      CC_DEBOUNCE, &timer_val_msecs);
 		if (tcpm_port_is_debug(port))
 			tcpm_set_state(port, DEBUG_ACC_ATTACHED,
-				       timer_val_msecs);
+				       PD_T_CC_DEBOUNCE);
 		else if (tcpm_port_is_audio(port))
 			tcpm_set_state(port, AUDIO_ACC_ATTACHED,
-				       timer_val_msecs);
+				       PD_T_CC_DEBOUNCE);
 		else if (tcpm_port_is_source(port) && port->vbus_vsafe0v)
 			tcpm_set_state(port,
 				       tcpm_try_snk(port) ? SNK_TRY
 							  : SRC_ATTACHED,
-				       timer_val_msecs);
+				       PD_T_CC_DEBOUNCE);
 		break;
 
 	case SNK_TRY:
@@ -4047,10 +4084,7 @@ static void run_state_machine(struct tcpm_port *port)
 		}
 		break;
 	case SRC_TRYWAIT_DEBOUNCE:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SRC_TRYWAIT_DEBOUNCE],
-						      CC_DEBOUNCE, &timer_val_msecs);
-		tcpm_set_state(port, SRC_ATTACHED, timer_val_msecs);
+		tcpm_set_state(port, SRC_ATTACHED, PD_T_CC_DEBOUNCE);
 		break;
 	case SRC_TRYWAIT_UNATTACHED:
 		tcpm_set_state(port, SNK_UNATTACHED, 0);
@@ -4101,7 +4135,7 @@ static void run_state_machine(struct tcpm_port *port)
 			port->caps_count = 0;
 			port->pd_capable = true;
 			tcpm_set_state_cond(port, SRC_SEND_CAPABILITIES_TIMEOUT,
-					    PD_T_SEND_SOURCE_CAP);
+					    PD_T_SENDER_RESPONSE);
 		}
 		break;
 	case SRC_SEND_CAPABILITIES_TIMEOUT:
@@ -4219,10 +4253,6 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_swap_complete(port, -ENOTCONN);
 		tcpm_pps_complete(port, -ENOTCONN);
 		tcpm_snk_detach(port);
-		if (port->potential_contaminant) {
-			tcpm_set_state(port, CHECK_CONTAMINANT, 0);
-			break;
-		}
 		if (tcpm_start_toggling(port, TYPEC_CC_RD)) {
 			tcpm_set_state(port, TOGGLING, 0);
 			break;
@@ -4232,18 +4262,15 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state(port, SRC_UNATTACHED, PD_T_DRP_SRC);
 		break;
 	case SNK_ATTACH_WAIT:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SNK_ATTACH_WAIT],
-						      CC_DEBOUNCE, &timer_val_msecs);
 		if ((port->cc1 == TYPEC_CC_OPEN &&
 		     port->cc2 != TYPEC_CC_OPEN) ||
 		    (port->cc1 != TYPEC_CC_OPEN &&
 		     port->cc2 == TYPEC_CC_OPEN))
 			tcpm_set_state(port, SNK_DEBOUNCED,
-				       timer_val_msecs);
+				       PD_T_CC_DEBOUNCE);
 		else if (tcpm_port_is_disconnected(port))
 			tcpm_set_state(port, SNK_UNATTACHED,
-				       timer_val_msecs);
+				       PD_T_PD_DEBOUNCE);
 		break;
 	case SNK_DEBOUNCED:
 		if (tcpm_port_is_disconnected(port))
@@ -4279,11 +4306,8 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_set_state(port, SRC_ATTACHED, PD_T_PD_DEBOUNCE);
 		break;
 	case SNK_TRYWAIT:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SNK_TRYWAIT],
-						      CC_DEBOUNCE, &timer_val_msecs);
 		tcpm_set_cc(port, TYPEC_CC_RD);
-		tcpm_set_state(port, SNK_TRYWAIT_VBUS, timer_val_msecs);
+		tcpm_set_state(port, SNK_TRYWAIT_VBUS, PD_T_CC_DEBOUNCE);
 		break;
 	case SNK_TRYWAIT_VBUS:
 		/*
@@ -4323,10 +4347,7 @@ static void run_state_machine(struct tcpm_port *port)
 			/* SRC -> SNK POWER/FAST_ROLE_SWAP finished */
 			tcpm_ams_finish(port);
 
-		timer_val_msecs = 0;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SNK_STARTUP],
-						      SINK_DISCOVERY_BC12, &timer_val_msecs);
-		tcpm_set_state(port, SNK_DISCOVERY, timer_val_msecs);
+		tcpm_set_state(port, SNK_DISCOVERY, 0);
 		break;
 	case SNK_DISCOVERY:
 		if (port->vbus_present) {
@@ -4335,10 +4356,7 @@ static void run_state_machine(struct tcpm_port *port)
 			if (port->slow_charger_loop && (current_lim > PD_P_SNK_STDBY_MW / 5))
 				current_lim = PD_P_SNK_STDBY_MW / 5;
 			tcpm_set_current_limit(port, current_lim, 5000);
-			/* Not sink vbus if operational current is 0mA */
-			tcpm_set_charge(port, !port->pd_supported ||
-					pdo_max_current(port->snk_pdo[0]));
-
+			tcpm_set_charge(port, true);
 			if (!port->pd_supported)
 				tcpm_set_state(port, SNK_READY, 0);
 			else
@@ -4355,10 +4373,8 @@ static void run_state_machine(struct tcpm_port *port)
 					PD_T_DB_DETECT : PD_T_NO_RESPONSE);
 		break;
 	case SNK_DISCOVERY_DEBOUNCE:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SNK_DISCOVERY_DEBOUNCE],
-						      CC_DEBOUNCE, &timer_val_msecs);
-		tcpm_set_state(port, SNK_DISCOVERY_DEBOUNCE_DONE, timer_val_msecs);
+		tcpm_set_state(port, SNK_DISCOVERY_DEBOUNCE_DONE,
+			       PD_T_CC_DEBOUNCE);
 		break;
 	case SNK_DISCOVERY_DEBOUNCE_DONE:
 		if (!tcpm_port_is_disconnected(port) &&
@@ -4376,9 +4392,6 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state(port, SNK_READY, 0);
 			break;
 		}
-		timer_val_msecs = PD_T_SINK_WAIT_CAP;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SNK_WAIT_CAPABILITIES],
-						      SINK_WAIT_CAP, &timer_val_msecs);
 		/*
 		 * If VBUS has never been low, and we time out waiting
 		 * for source cap, try a soft reset first, in case we
@@ -4388,10 +4401,10 @@ static void run_state_machine(struct tcpm_port *port)
 		if (port->vbus_never_low) {
 			port->vbus_never_low = false;
 			tcpm_set_state(port, SNK_SOFT_RESET,
-				       timer_val_msecs);
+				       PD_T_SINK_WAIT_CAP);
 		} else {
 			tcpm_set_state(port, hard_reset_state(port),
-				       timer_val_msecs);
+				       PD_T_SINK_WAIT_CAP);
 		}
 		break;
 	case SNK_NEGOTIATE_CAPABILITIES:
@@ -4519,10 +4532,7 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state(port, ACC_UNATTACHED, 0);
 		break;
 	case AUDIO_ACC_DEBOUNCE:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[AUDIO_ACC_DEBOUNCE],
-						      CC_DEBOUNCE, &timer_val_msecs);
-		tcpm_set_state(port, ACC_UNATTACHED, timer_val_msecs);
+		tcpm_set_state(port, ACC_UNATTACHED, PD_T_CC_DEBOUNCE);
 		break;
 
 	/* Hard_Reset states */
@@ -4560,7 +4570,7 @@ static void run_state_machine(struct tcpm_port *port)
 		 */
 		tcpm_set_vconn(port, false);
 		tcpm_set_vbus(port, false);
-		tcpm_set_roles(port, port->self_powered, TYPEC_SOURCE,
+		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SOURCE,
 			       tcpm_data_role_for_source(port));
 		/*
 		 * If tcpc fails to notify vbus off, TCPM will wait for PD_T_SAFE_0V +
@@ -4592,7 +4602,7 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_set_vconn(port, false);
 		if (port->pd_capable)
 			tcpm_set_charge(port, false);
-		tcpm_set_roles(port, port->self_powered, TYPEC_SINK,
+		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,
 			       tcpm_data_role_for_sink(port));
 		/*
 		 * VBUS may or may not toggle, depending on the adapter.
@@ -4629,8 +4639,7 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_current_limit(port,
 					       tcpm_get_current_limit(port),
 					       5000);
-			/* Not sink vbus if operational current is 0mA */
-			tcpm_set_charge(port, !!pdo_max_current(port->snk_pdo[0]));
+			tcpm_set_charge(port, true);
 		}
 		if (port->ams == HARD_RESET)
 			tcpm_ams_finish(port);
@@ -4647,6 +4656,8 @@ static void run_state_machine(struct tcpm_port *port)
 		usb_power_delivery_unregister_capabilities(port->partner_source_caps);
 		port->partner_source_caps = NULL;
 		tcpm_pd_send_control(port, PD_CTRL_ACCEPT);
+		port->vdm_sm_running = false;
+		port->explicit_contract = false;
 		tcpm_ams_finish(port);
 		if (port->pwr_role == TYPEC_SOURCE) {
 			port->upcoming_state = SRC_SEND_CAPABILITIES;
@@ -4698,10 +4709,10 @@ static void run_state_machine(struct tcpm_port *port)
 	case DR_SWAP_CHANGE_DR:
 		tcpm_unregister_altmodes(port);
 		if (port->data_role == TYPEC_HOST)
-			tcpm_set_roles(port, true, port->pwr_role,
+			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
 				       TYPEC_DEVICE);
 		else
-			tcpm_set_roles(port, true, port->pwr_role,
+			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
 				       TYPEC_HOST);
 		tcpm_ams_finish(port);
 		tcpm_set_state(port, ready_state(port), 0);
@@ -4718,10 +4729,7 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_set_state(port, ERROR_RECOVERY, 0);
 		break;
 	case FR_SWAP_SNK_SRC_TRANSITION_TO_OFF:
-		timer_val_msecs = PD_T_PS_SOURCE_OFF;
-		state_name = tcpm_states[FR_SWAP_SNK_SRC_TRANSITION_TO_OFF];
-		trace_android_vh_typec_tcpm_get_timer(state_name, SOURCE_OFF, &timer_val_msecs);
-		tcpm_set_state(port, ERROR_RECOVERY, timer_val_msecs);
+		tcpm_set_state(port, ERROR_RECOVERY, PD_T_PS_SOURCE_OFF);
 		break;
 	case FR_SWAP_SNK_SRC_NEW_SINK_READY:
 		if (port->vbus_source)
@@ -4773,13 +4781,10 @@ static void run_state_machine(struct tcpm_port *port)
 			       PD_T_SRCSWAPSTDBY);
 		break;
 	case PR_SWAP_SRC_SNK_SOURCE_OFF:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[PR_SWAP_SRC_SNK_SOURCE_OFF],
-						      CC_DEBOUNCE, &timer_val_msecs);
 		tcpm_set_cc(port, TYPEC_CC_RD);
 		/* allow CC debounce */
 		tcpm_set_state(port, PR_SWAP_SRC_SNK_SOURCE_OFF_CC_DEBOUNCED,
-			       timer_val_msecs);
+			       PD_T_CC_DEBOUNCE);
 		break;
 	case PR_SWAP_SRC_SNK_SOURCE_OFF_CC_DEBOUNCED:
 		/*
@@ -4806,9 +4811,6 @@ static void run_state_machine(struct tcpm_port *port)
 		/* will be source, remove existing capabilities */
 		usb_power_delivery_unregister_capabilities(port->partner_source_caps);
 		port->partner_source_caps = NULL;
-		timer_val_msecs = PD_T_PS_SOURCE_OFF;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[PR_SWAP_SNK_SRC_SINK_OFF],
-						      SOURCE_OFF, &timer_val_msecs);
 		/*
 		 * Prevent vbus discharge circuit from turning on during PR_SWAP
 		 * as this is not a disconnect.
@@ -4816,7 +4818,8 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_set_auto_vbus_discharge_threshold(port, TYPEC_PWR_MODE_USB,
 						       port->pps_data.active, 0);
 		tcpm_set_charge(port, false);
-		tcpm_set_state(port, hard_reset_state(port), timer_val_msecs);
+		tcpm_set_state(port, hard_reset_state(port),
+			       PD_T_PS_SOURCE_OFF);
 		break;
 	case PR_SWAP_SNK_SRC_SOURCE_ON:
 		tcpm_enable_auto_vbus_discharge(port, true);
@@ -4946,12 +4949,9 @@ static void run_state_machine(struct tcpm_port *port)
 			       PD_T_ERROR_RECOVERY);
 		break;
 	case PORT_RESET_WAIT_OFF:
-		timer_val_msecs = PD_T_PS_SOURCE_OFF;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[PORT_RESET_WAIT_OFF],
-						      SOURCE_OFF, &timer_val_msecs);
 		tcpm_set_state(port,
 			       tcpm_default_state(port),
-			       port->vbus_present ? timer_val_msecs : 0);
+			       port->vbus_present ? PD_T_PS_SOURCE_OFF : 0);
 		break;
 
 	/* AMS intermediate state */
@@ -5040,9 +5040,6 @@ static void _tcpm_cc_change(struct tcpm_port *port, enum typec_cc_status cc1,
 			tcpm_set_state(port, SRC_ATTACH_WAIT, 0);
 		else if (tcpm_port_is_sink(port))
 			tcpm_set_state(port, SNK_ATTACH_WAIT, 0);
-		break;
-	case CHECK_CONTAMINANT:
-		/* Wait for Toggling to be resumed */
 		break;
 	case SRC_UNATTACHED:
 	case ACC_UNATTACHED:
@@ -5160,7 +5157,7 @@ static void _tcpm_cc_change(struct tcpm_port *port, enum typec_cc_status cc1,
 	case SNK_TRY_WAIT_DEBOUNCE:
 		if (!tcpm_port_is_sink(port)) {
 			port->max_wait = 0;
-			tcpm_set_state(port, SRC_TRYWAIT, 0);
+			tcpm_set_state(port, SRC_TRYWAIT, PD_T_PD_DEBOUNCE);
 		}
 		break;
 	case SRC_TRY_WAIT:
@@ -5420,8 +5417,6 @@ static void _tcpm_pd_vbus_off(struct tcpm_port *port)
 
 static void _tcpm_pd_vbus_vsafe0v(struct tcpm_port *port)
 {
-	unsigned int timer_val_msecs;
-
 	tcpm_log_force(port, "VBUS VSAFE0V");
 	port->vbus_vsafe0v = true;
 	switch (port->state) {
@@ -5433,12 +5428,9 @@ static void _tcpm_pd_vbus_vsafe0v(struct tcpm_port *port)
 		tcpm_set_state(port, SRC_HARD_RESET_VBUS_ON, PD_T_SRC_RECOVER);
 		break;
 	case SRC_ATTACH_WAIT:
-		timer_val_msecs = PD_T_CC_DEBOUNCE;
-		trace_android_vh_typec_tcpm_get_timer(tcpm_states[SRC_ATTACH_WAIT],
-						      CC_DEBOUNCE, &timer_val_msecs);
 		if (tcpm_port_is_source(port))
 			tcpm_set_state(port, tcpm_try_snk(port) ? SNK_TRY : SRC_ATTACHED,
-				       timer_val_msecs);
+				       PD_T_CC_DEBOUNCE);
 		break;
 	case SRC_STARTUP:
 	case SRC_SEND_CAPABILITIES:
@@ -5537,38 +5529,9 @@ static void tcpm_pd_event_handler(struct kthread_work *work)
 		}
 		if (events & TCPM_CC_EVENT) {
 			enum typec_cc_status cc1, cc2;
-			bool modified = false;
 
 			if (port->tcpc->get_cc(port->tcpc, &cc1, &cc2) == 0)
 				_tcpm_cc_change(port, cc1, cc2);
-
-			trace_android_vh_typec_tcpm_modify_src_caps(&port->nr_src_pdo,
-								    &port->src_pdo, &modified);
-			if (modified) {
-				int ret;
-
-				switch (port->state) {
-				case SRC_UNATTACHED:
-				case SRC_ATTACH_WAIT:
-				case SRC_TRYWAIT:
-					tcpm_set_cc(port, tcpm_rp_cc(port));
-					break;
-				case SRC_SEND_CAPABILITIES:
-				case SRC_SEND_CAPABILITIES_TIMEOUT:
-				case SRC_NEGOTIATE_CAPABILITIES:
-				case SRC_READY:
-				case SRC_WAIT_NEW_CAPABILITIES:
-					port->caps_count = 0;
-					port->upcoming_state = SRC_SEND_CAPABILITIES;
-					ret = tcpm_ams_start(port, POWER_NEGOTIATION);
-					if (ret == -EAGAIN)
-						port->upcoming_state = INVALID_STATE;
-					break;
-				default:
-					break;
-				}
-			}
-
 		}
 		if (events & TCPM_FRS_EVENT) {
 			if (port->state == SNK_READY) {
@@ -5593,15 +5556,6 @@ static void tcpm_pd_event_handler(struct kthread_work *work)
 			 */
 			port->vbus_source = true;
 			_tcpm_pd_vbus_on(port);
-		}
-		if (events & TCPM_PORT_CLEAN) {
-			tcpm_log(port, "port clean");
-			if (port->state == CHECK_CONTAMINANT) {
-				if (tcpm_start_toggling(port, tcpm_rp_cc(port)))
-					tcpm_set_state(port, TOGGLING, 0);
-				else
-					tcpm_set_state(port, tcpm_default_state(port), 0);
-			}
 		}
 
 		spin_lock(&port->pd_event_lock);
@@ -5654,21 +5608,6 @@ void tcpm_sourcing_vbus(struct tcpm_port *port)
 	kthread_queue_work(port->wq, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_sourcing_vbus);
-
-void tcpm_port_clean(struct tcpm_port *port)
-{
-	spin_lock(&port->pd_event_lock);
-	port->pd_events |= TCPM_PORT_CLEAN;
-	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
-}
-EXPORT_SYMBOL_GPL(tcpm_port_clean);
-
-bool tcpm_port_is_toggling(struct tcpm_port *port)
-{
-	return port->port_type == TYPEC_PORT_DRP && port->state == TOGGLING;
-}
-EXPORT_SYMBOL_GPL(tcpm_port_is_toggling);
 
 static void tcpm_enable_frs_work(struct kthread_work *work)
 {
@@ -5991,6 +5930,12 @@ static int tcpm_pps_set_out_volt(struct tcpm_port *port, u16 req_out_volt)
 		goto port_unlock;
 	}
 
+	if (req_out_volt < port->pps_data.min_volt ||
+	    req_out_volt > port->pps_data.max_volt) {
+		ret = -EINVAL;
+		goto port_unlock;
+	}
+
 	target_mw = (port->current_limit * req_out_volt) / 1000;
 	if (target_mw < port->operating_snk_mw) {
 		ret = -EINVAL;
@@ -6161,116 +6106,12 @@ port_unlock:
 	return 0;
 }
 
-static struct pd_data *tcpm_find_pd_data(struct tcpm_port *port, struct usb_power_delivery *pd)
-{
-	int i;
-
-	for (i = 0; port->pd_list[i]; i++) {
-		if (port->pd_list[i]->pd == pd)
-			return port->pd_list[i];
-	}
-
-	return ERR_PTR(-ENODATA);
-}
-
-static struct usb_power_delivery **tcpm_pd_get(struct typec_port *p)
-{
-	struct tcpm_port *port = typec_get_drvdata(p);
-
-	return port->pds;
-}
-
-static int tcpm_pd_set(struct typec_port *p, struct usb_power_delivery *pd)
-{
-	struct tcpm_port *port = typec_get_drvdata(p);
-	struct pd_data *data;
-	int i, ret = 0;
-
-	mutex_lock(&port->lock);
-
-	if (port->selected_pd == pd)
-		goto unlock;
-
-	data = tcpm_find_pd_data(port, pd);
-	if (IS_ERR(data)) {
-		ret = PTR_ERR(data);
-		goto unlock;
-	}
-
-	if (data->sink_desc.pdo[0]) {
-		for (i = 0; i < PDO_MAX_OBJECTS && data->sink_desc.pdo[i]; i++)
-			port->snk_pdo[i] = data->sink_desc.pdo[i];
-		port->nr_snk_pdo = i;
-		port->operating_snk_mw = data->operating_snk_mw;
-	}
-
-	if (data->source_desc.pdo[0]) {
-		for (i = 0; i < PDO_MAX_OBJECTS && data->source_desc.pdo[i]; i++)
-			port->src_pdo[i] = data->source_desc.pdo[i];
-		port->nr_src_pdo = i;
-	}
-
-	switch (port->state) {
-	case SRC_UNATTACHED:
-	case SRC_ATTACH_WAIT:
-	case SRC_TRYWAIT:
-		tcpm_set_cc(port, tcpm_rp_cc(port));
-		break;
-	case SRC_SEND_CAPABILITIES:
-	case SRC_SEND_CAPABILITIES_TIMEOUT:
-	case SRC_NEGOTIATE_CAPABILITIES:
-	case SRC_READY:
-	case SRC_WAIT_NEW_CAPABILITIES:
-		port->caps_count = 0;
-		port->upcoming_state = SRC_SEND_CAPABILITIES;
-		ret = tcpm_ams_start(port, POWER_NEGOTIATION);
-		if (ret == -EAGAIN) {
-			port->upcoming_state = INVALID_STATE;
-			goto unlock;
-		}
-		break;
-	case SNK_NEGOTIATE_CAPABILITIES:
-	case SNK_NEGOTIATE_PPS_CAPABILITIES:
-	case SNK_READY:
-	case SNK_TRANSITION_SINK:
-	case SNK_TRANSITION_SINK_VBUS:
-		if (port->pps_data.active)
-			port->upcoming_state = SNK_NEGOTIATE_PPS_CAPABILITIES;
-		else if (port->pd_capable)
-			port->upcoming_state = SNK_NEGOTIATE_CAPABILITIES;
-		else
-			break;
-
-		port->update_sink_caps = true;
-
-		ret = tcpm_ams_start(port, POWER_NEGOTIATION);
-		if (ret == -EAGAIN) {
-			port->upcoming_state = INVALID_STATE;
-			goto unlock;
-		}
-		break;
-	default:
-		break;
-	}
-
-	port->port_source_caps = data->source_cap;
-	port->port_sink_caps = data->sink_cap;
-	typec_port_set_usb_power_delivery(p, NULL);
-	port->selected_pd = pd;
-	typec_port_set_usb_power_delivery(p, port->selected_pd);
-unlock:
-	mutex_unlock(&port->lock);
-	return ret;
-}
-
 static const struct typec_operations tcpm_ops = {
 	.try_role = tcpm_try_role,
 	.dr_set = tcpm_dr_set,
 	.pr_set = tcpm_pr_set,
 	.vconn_set = tcpm_vconn_set,
-	.port_type_set = tcpm_port_type_set,
-	.pd_get = tcpm_pd_get,
-	.pd_set = tcpm_pd_set
+	.port_type_set = tcpm_port_type_set
 };
 
 void tcpm_tcpc_reset(struct tcpm_port *port)
@@ -6284,61 +6125,58 @@ EXPORT_SYMBOL_GPL(tcpm_tcpc_reset);
 
 static void tcpm_port_unregister_pd(struct tcpm_port *port)
 {
-	int i;
-
+	usb_power_delivery_unregister_capabilities(port->port_sink_caps);
 	port->port_sink_caps = NULL;
+	usb_power_delivery_unregister_capabilities(port->port_source_caps);
 	port->port_source_caps = NULL;
-	for (i = 0; i < port->pd_count; i++) {
-		usb_power_delivery_unregister_capabilities(port->pd_list[i]->sink_cap);
-		usb_power_delivery_unregister_capabilities(port->pd_list[i]->source_cap);
-		devm_kfree(port->dev, port->pd_list[i]);
-		port->pd_list[i] = NULL;
-		usb_power_delivery_unregister(port->pds[i]);
-		port->pds[i] = NULL;
-	}
+	usb_power_delivery_unregister(port->pd);
+	port->pd = NULL;
 }
 
 static int tcpm_port_register_pd(struct tcpm_port *port)
 {
 	struct usb_power_delivery_desc desc = { port->typec_caps.pd_revision };
+	struct usb_power_delivery_capabilities_desc caps = { };
 	struct usb_power_delivery_capabilities *cap;
-	int ret, i;
+	int ret;
 
 	if (!port->nr_src_pdo && !port->nr_snk_pdo)
 		return 0;
 
-	for (i = 0; i < port->pd_count; i++) {
-		port->pds[i] = usb_power_delivery_register(port->dev, &desc);
-		if (IS_ERR(port->pds[i])) {
-			ret = PTR_ERR(port->pds[i]);
-			goto err_unregister;
-		}
-		port->pd_list[i]->pd = port->pds[i];
-
-		if (port->pd_list[i]->source_desc.pdo[0]) {
-			cap = usb_power_delivery_register_capabilities(port->pds[i],
-								&port->pd_list[i]->source_desc);
-			if (IS_ERR(cap)) {
-				ret = PTR_ERR(cap);
-				goto err_unregister;
-			}
-			port->pd_list[i]->source_cap = cap;
-		}
-
-		if (port->pd_list[i]->sink_desc.pdo[0]) {
-			cap = usb_power_delivery_register_capabilities(port->pds[i],
-								&port->pd_list[i]->sink_desc);
-			if (IS_ERR(cap)) {
-				ret = PTR_ERR(cap);
-				goto err_unregister;
-			}
-			port->pd_list[i]->sink_cap = cap;
-		}
+	port->pd = usb_power_delivery_register(port->dev, &desc);
+	if (IS_ERR(port->pd)) {
+		ret = PTR_ERR(port->pd);
+		goto err_unregister;
 	}
 
-	port->port_source_caps = port->pd_list[0]->source_cap;
-	port->port_sink_caps = port->pd_list[0]->sink_cap;
-	port->selected_pd = port->pds[0];
+	if (port->nr_src_pdo) {
+		memcpy_and_pad(caps.pdo, sizeof(caps.pdo), port->src_pdo,
+			       port->nr_src_pdo * sizeof(u32), 0);
+		caps.role = TYPEC_SOURCE;
+
+		cap = usb_power_delivery_register_capabilities(port->pd, &caps);
+		if (IS_ERR(cap)) {
+			ret = PTR_ERR(cap);
+			goto err_unregister;
+		}
+
+		port->port_source_caps = cap;
+	}
+
+	if (port->nr_snk_pdo) {
+		memcpy_and_pad(caps.pdo, sizeof(caps.pdo), port->snk_pdo,
+			       port->nr_snk_pdo * sizeof(u32), 0);
+		caps.role = TYPEC_SINK;
+
+		cap = usb_power_delivery_register_capabilities(port->pd, &caps);
+		if (IS_ERR(cap)) {
+			ret = PTR_ERR(cap);
+			goto err_unregister;
+		}
+
+		port->port_sink_caps = cap;
+	}
+
 	return 0;
 
 err_unregister:
@@ -6347,15 +6185,12 @@ err_unregister:
 	return ret;
 }
 
-static int tcpm_fw_get_caps(struct tcpm_port *port, struct fwnode_handle *fwnode)
+static int tcpm_fw_get_caps(struct tcpm_port *port,
+			    struct fwnode_handle *fwnode)
 {
-	struct fwnode_handle *capabilities, *child, *caps = NULL;
-	unsigned int nr_src_pdo, nr_snk_pdo;
 	const char *opmode_str;
-	u32 *src_pdo, *snk_pdo;
-	u32 uw, frs_current;
-	int ret = 0, i;
-	int mode;
+	int ret;
+	u32 mw, frs_current;
 
 	if (!fwnode)
 		return -EINVAL;
@@ -6373,20 +6208,30 @@ static int tcpm_fw_get_caps(struct tcpm_port *port, struct fwnode_handle *fwnode
 	if (ret < 0)
 		return ret;
 
-	mode = 0;
-
-	if (fwnode_property_read_bool(fwnode, "accessory-mode-audio"))
-		port->typec_caps.accessory[mode++] = TYPEC_ACCESSORY_AUDIO;
-
-	if (fwnode_property_read_bool(fwnode, "accessory-mode-debug"))
-		port->typec_caps.accessory[mode++] = TYPEC_ACCESSORY_DEBUG;
-
 	port->port_type = port->typec_caps.type;
 	port->pd_supported = !fwnode_property_read_bool(fwnode, "pd-disable");
-	port->slow_charger_loop = fwnode_property_read_bool(fwnode, "slow-charger-loop");
-	port->self_powered = fwnode_property_read_bool(fwnode, "self-powered");
 
-	if (!port->pd_supported) {
+	port->slow_charger_loop = fwnode_property_read_bool(fwnode, "slow-charger-loop");
+	if (port->port_type == TYPEC_PORT_SNK)
+		goto sink;
+
+	/* Get Source PDOs for the PD port or Source Rp value for the non-PD port */
+	if (port->pd_supported) {
+		ret = fwnode_property_count_u32(fwnode, "source-pdos");
+		if (ret == 0)
+			return -EINVAL;
+		else if (ret < 0)
+			return ret;
+
+		port->nr_src_pdo = min(ret, PDO_MAX_OBJECTS);
+		ret = fwnode_property_read_u32_array(fwnode, "source-pdos",
+						     port->src_pdo, port->nr_src_pdo);
+		if (ret)
+			return ret;
+		ret = tcpm_validate_caps(port, port->src_pdo, port->nr_src_pdo);
+		if (ret)
+			return ret;
+	} else {
 		ret = fwnode_property_read_string(fwnode, "typec-power-opmode", &opmode_str);
 		if (ret)
 			return ret;
@@ -6394,150 +6239,45 @@ static int tcpm_fw_get_caps(struct tcpm_port *port, struct fwnode_handle *fwnode
 		if (ret < 0)
 			return ret;
 		port->src_rp = tcpm_pwr_opmode_to_rp(ret);
-		return 0;
 	}
 
-	/* The following code are applicable to pd-capable ports, i.e. pd_supported is true. */
+	if (port->port_type == TYPEC_PORT_SRC)
+		return 0;
+
+sink:
+	port->self_powered = fwnode_property_read_bool(fwnode, "self-powered");
+
+	if (!port->pd_supported)
+		return 0;
+
+	/* Get sink pdos */
+	ret = fwnode_property_count_u32(fwnode, "sink-pdos");
+	if (ret <= 0)
+		return -EINVAL;
+
+	port->nr_snk_pdo = min(ret, PDO_MAX_OBJECTS);
+	ret = fwnode_property_read_u32_array(fwnode, "sink-pdos",
+					     port->snk_pdo, port->nr_snk_pdo);
+	if ((ret < 0) || tcpm_validate_caps(port, port->snk_pdo,
+					    port->nr_snk_pdo))
+		return -EINVAL;
+
+	if (fwnode_property_read_u32(fwnode, "op-sink-microwatt", &mw) < 0)
+		return -EINVAL;
+	port->operating_snk_mw = mw / 1000;
 
 	/* FRS can only be supported by DRP ports */
 	if (port->port_type == TYPEC_PORT_DRP) {
 		ret = fwnode_property_read_u32(fwnode, "new-source-frs-typec-current",
 					       &frs_current);
-		if (!ret && frs_current <= FRS_5V_3A)
+		if (ret >= 0 && frs_current <= FRS_5V_3A)
 			port->new_source_frs_current = frs_current;
-
-		if (ret)
-			ret = 0;
 	}
-
-	/* For the backward compatibility, "capabilities" node is optional. */
-	capabilities = fwnode_get_named_child_node(fwnode, "capabilities");
-	if (!capabilities) {
-		port->pd_count = 1;
-	} else {
-		fwnode_for_each_child_node(capabilities, child)
-			port->pd_count++;
-
-		if (!port->pd_count) {
-			ret = -ENODATA;
-			goto put_capabilities;
-		}
-	}
-
-	port->pds = devm_kcalloc(port->dev, port->pd_count, sizeof(struct usb_power_delivery *),
-				 GFP_KERNEL);
-	if (!port->pds) {
-		ret = -ENOMEM;
-		goto put_capabilities;
-	}
-
-	port->pd_list = devm_kcalloc(port->dev, port->pd_count, sizeof(struct pd_data *),
-				     GFP_KERNEL);
-	if (!port->pd_list) {
-		ret = -ENOMEM;
-		goto put_capabilities;
-	}
-
-	for (i = 0; i < port->pd_count; i++) {
-		port->pd_list[i] = devm_kzalloc(port->dev, sizeof(struct pd_data), GFP_KERNEL);
-		if (!port->pd_list[i]) {
-			ret = -ENOMEM;
-			goto put_capabilities;
-		}
-
-		src_pdo = port->pd_list[i]->source_desc.pdo;
-		port->pd_list[i]->source_desc.role = TYPEC_SOURCE;
-		snk_pdo = port->pd_list[i]->sink_desc.pdo;
-		port->pd_list[i]->sink_desc.role = TYPEC_SINK;
-
-		/* If "capabilities" is NULL, fall back to single pd cap population. */
-		if (!capabilities)
-			caps = fwnode;
-		else
-			caps = fwnode_get_next_child_node(capabilities, caps);
-
-		if (port->port_type != TYPEC_PORT_SNK) {
-			ret = fwnode_property_count_u32(caps, "source-pdos");
-			if (ret == 0) {
-				ret = -EINVAL;
-				goto put_caps;
-			}
-			if (ret < 0)
-				goto put_caps;
-
-			nr_src_pdo = min(ret, PDO_MAX_OBJECTS);
-			ret = fwnode_property_read_u32_array(caps, "source-pdos", src_pdo,
-							     nr_src_pdo);
-			if (ret)
-				goto put_caps;
-
-			ret = tcpm_validate_caps(port, src_pdo, nr_src_pdo);
-			if (ret)
-				goto put_caps;
-
-			if (i == 0) {
-				port->nr_src_pdo = nr_src_pdo;
-				memcpy_and_pad(port->src_pdo, sizeof(u32) * PDO_MAX_OBJECTS,
-					       port->pd_list[0]->source_desc.pdo,
-					       sizeof(u32) * nr_src_pdo,
-					       0);
-			}
-		}
-
-		if (port->port_type != TYPEC_PORT_SRC) {
-			ret = fwnode_property_count_u32(caps, "sink-pdos");
-			if (ret == 0) {
-				ret = -EINVAL;
-				goto put_caps;
-			}
-
-			if (ret < 0)
-				goto put_caps;
-
-			nr_snk_pdo = min(ret, PDO_MAX_OBJECTS);
-			ret = fwnode_property_read_u32_array(caps, "sink-pdos", snk_pdo,
-							     nr_snk_pdo);
-			if (ret)
-				goto put_caps;
-
-			ret = tcpm_validate_caps(port, snk_pdo, nr_snk_pdo);
-			if (ret)
-				goto put_caps;
-
-			if (fwnode_property_read_u32(caps, "op-sink-microwatt", &uw) < 0) {
-				ret = -EINVAL;
-				goto put_caps;
-			}
-
-			port->pd_list[i]->operating_snk_mw = uw / 1000;
-
-			if (i == 0) {
-				port->nr_snk_pdo = nr_snk_pdo;
-				memcpy_and_pad(port->snk_pdo, sizeof(u32) * PDO_MAX_OBJECTS,
-					       port->pd_list[0]->sink_desc.pdo,
-					       sizeof(u32) * nr_snk_pdo,
-					       0);
-				port->operating_snk_mw = port->pd_list[0]->operating_snk_mw;
-			}
-		}
-	}
-
-put_caps:
-	if (caps != fwnode)
-		fwnode_handle_put(caps);
-put_capabilities:
-	fwnode_handle_put(capabilities);
-	return ret;
-}
-
-static int tcpm_fw_get_snk_vdos(struct tcpm_port *port, struct fwnode_handle *fwnode)
-{
-	int ret;
 
 	/* sink-vdos is optional */
 	ret = fwnode_property_count_u32(fwnode, "sink-vdos");
 	if (ret < 0)
-		return 0;
+		ret = 0;
 
 	port->nr_snk_vdo = min(ret, VDO_MAX_OBJECTS);
 	if (port->nr_snk_vdo) {
@@ -6724,7 +6464,11 @@ static int tcpm_psy_set_prop(struct power_supply *psy,
 		ret = tcpm_psy_set_online(port, val);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		ret = tcpm_pps_set_out_volt(port, val->intval / 1000);
+		if (val->intval < port->pps_data.min_volt * 1000 ||
+		    val->intval > port->pps_data.max_volt * 1000)
+			ret = -EINVAL;
+		else
+			ret = tcpm_pps_set_out_volt(port, val->intval / 1000);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		if (val->intval > port->pps_data.max_curr * 1000)
@@ -6881,12 +6625,10 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	err = tcpm_fw_get_caps(port, tcpc->fwnode);
 	if (err < 0)
 		goto out_destroy_wq;
-	err = tcpm_fw_get_snk_vdos(port, tcpc->fwnode);
-	if (err < 0)
-		goto out_destroy_wq;
 
 	port->try_role = port->typec_caps.prefer_role;
 
+	port->typec_caps.fwnode = tcpc->fwnode;
 	port->typec_caps.revision = 0x0120;	/* Type-C spec release 1.2 */
 	port->typec_caps.pd_revision = 0x0300;	/* USB-PD spec release 3.0 */
 	port->typec_caps.svdm_version = SVDM_VER_2_0;
@@ -6895,6 +6637,7 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	port->typec_caps.orientation_aware = 1;
 
 	port->partner_desc.identity = &port->partner_ident;
+	port->port_type = port->typec_caps.type;
 
 	port->role_sw = usb_role_switch_get(port->dev);
 	if (IS_ERR(port->role_sw)) {
@@ -6911,8 +6654,7 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	if (err)
 		goto out_role_sw_put;
 
-	if (port->pds)
-		port->typec_caps.pd = port->pds[0];
+	port->typec_caps.pd = port->pd;
 
 	port->typec_port = typec_register_port(port->dev, &port->typec_caps);
 	if (IS_ERR(port->typec_port)) {

@@ -750,6 +750,7 @@ config LIBC_SEC
 
 config PLDMFW
 	bool
+	select CRC32
 	default n
 
 config ASN1_ENCODER

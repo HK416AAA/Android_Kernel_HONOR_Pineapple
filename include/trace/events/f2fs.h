@@ -49,7 +49,6 @@ TRACE_DEFINE_ENUM(CP_TRIMMED);
 TRACE_DEFINE_ENUM(CP_PAUSE);
 TRACE_DEFINE_ENUM(CP_RESIZE);
 TRACE_DEFINE_ENUM(EX_READ);
-TRACE_DEFINE_ENUM(EX_BLOCK_AGE);
 
 #define show_block_type(type)						\
 	__print_symbolic(type,						\
@@ -156,11 +155,6 @@ TRACE_DEFINE_ENUM(EX_BLOCK_AGE);
 		{ COMPRESS_LZ4,		"LZ4" },			\
 		{ COMPRESS_ZSTD,	"ZSTD" },			\
 		{ COMPRESS_LZORLE,	"LZO-RLE" })
-
-#define show_extent_type(type)						\
-	__print_symbolic(type,						\
-		{ EX_READ,	"Read" },				\
-		{ EX_BLOCK_AGE,	"Block Age" })
 
 struct f2fs_sb_info;
 struct f2fs_io_info;
@@ -1446,7 +1440,7 @@ TRACE_EVENT(f2fs_readpages,
 
 TRACE_EVENT(f2fs_write_checkpoint,
 
-	TP_PROTO(struct super_block *sb, int reason, const char *msg),
+	TP_PROTO(struct super_block *sb, int reason, char *msg),
 
 	TP_ARGS(sb, reason, msg),
 
@@ -1585,7 +1579,7 @@ TRACE_EVENT(f2fs_lookup_extent_tree_start,
 	TP_printk("dev = (%d,%d), ino = %lu, pgofs = %u, type = %s",
 		show_dev_ino(__entry),
 		__entry->pgofs,
-		show_extent_type(__entry->type))
+		__entry->type == EX_READ ? "Read" : "N/A")
 );
 
 TRACE_EVENT_CONDITION(f2fs_lookup_read_extent_tree_end,
@@ -1624,45 +1618,6 @@ TRACE_EVENT_CONDITION(f2fs_lookup_read_extent_tree_end,
 		__entry->blk)
 );
 
-TRACE_EVENT_CONDITION(f2fs_lookup_age_extent_tree_end,
-
-	TP_PROTO(struct inode *inode, unsigned int pgofs,
-						struct extent_info *ei),
-
-	TP_ARGS(inode, pgofs, ei),
-
-	TP_CONDITION(ei),
-
-	TP_STRUCT__entry(
-		__field(dev_t,	dev)
-		__field(ino_t,	ino)
-		__field(unsigned int, pgofs)
-		__field(unsigned int, fofs)
-		__field(unsigned int, len)
-		__field(unsigned long long, age)
-		__field(unsigned long long, blocks)
-	),
-
-	TP_fast_assign(
-		__entry->dev = inode->i_sb->s_dev;
-		__entry->ino = inode->i_ino;
-		__entry->pgofs = pgofs;
-		__entry->fofs = ei->fofs;
-		__entry->len = ei->len;
-		__entry->age = ei->age;
-		__entry->blocks = ei->last_blocks;
-	),
-
-	TP_printk("dev = (%d,%d), ino = %lu, pgofs = %u, "
-		"age_ext_info(fofs: %u, len: %u, age: %llu, blocks: %llu)",
-		show_dev_ino(__entry),
-		__entry->pgofs,
-		__entry->fofs,
-		__entry->len,
-		__entry->age,
-		__entry->blocks)
-);
-
 TRACE_EVENT(f2fs_update_read_extent_tree_range,
 
 	TP_PROTO(struct inode *inode, unsigned int pgofs, unsigned int len,
@@ -1698,41 +1653,6 @@ TRACE_EVENT(f2fs_update_read_extent_tree_range,
 		__entry->c_len)
 );
 
-TRACE_EVENT(f2fs_update_age_extent_tree_range,
-
-	TP_PROTO(struct inode *inode, unsigned int pgofs, unsigned int len,
-					unsigned long long age,
-					unsigned long long last_blks),
-
-	TP_ARGS(inode, pgofs, len, age, last_blks),
-
-	TP_STRUCT__entry(
-		__field(dev_t,	dev)
-		__field(ino_t,	ino)
-		__field(unsigned int, pgofs)
-		__field(unsigned int, len)
-		__field(unsigned long long, age)
-		__field(unsigned long long, blocks)
-	),
-
-	TP_fast_assign(
-		__entry->dev = inode->i_sb->s_dev;
-		__entry->ino = inode->i_ino;
-		__entry->pgofs = pgofs;
-		__entry->len = len;
-		__entry->age = age;
-		__entry->blocks = last_blks;
-	),
-
-	TP_printk("dev = (%d,%d), ino = %lu, pgofs = %u, "
-				"len = %u, age = %llu, blocks = %llu",
-		show_dev_ino(__entry),
-		__entry->pgofs,
-		__entry->len,
-		__entry->age,
-		__entry->blocks)
-);
-
 TRACE_EVENT(f2fs_shrink_extent_tree,
 
 	TP_PROTO(struct f2fs_sb_info *sbi, unsigned int node_cnt,
@@ -1758,7 +1678,7 @@ TRACE_EVENT(f2fs_shrink_extent_tree,
 		show_dev(__entry->dev),
 		__entry->node_cnt,
 		__entry->tree_cnt,
-		show_extent_type(__entry->type))
+		__entry->type == EX_READ ? "Read" : "N/A")
 );
 
 TRACE_EVENT(f2fs_destroy_extent_tree,
@@ -1785,7 +1705,7 @@ TRACE_EVENT(f2fs_destroy_extent_tree,
 	TP_printk("dev = (%d,%d), ino = %lu, destroyed: node_cnt = %u, type = %s",
 		show_dev_ino(__entry),
 		__entry->node_cnt,
-		show_extent_type(__entry->type))
+		__entry->type == EX_READ ? "Read" : "N/A")
 );
 
 DECLARE_EVENT_CLASS(f2fs_sync_dirty_inodes,
@@ -2010,7 +1930,7 @@ TRACE_EVENT(f2fs_iostat,
 		__entry->fs_cdrio	= iostat[FS_CDATA_READ_IO];
 		__entry->fs_nrio	= iostat[FS_NODE_READ_IO];
 		__entry->fs_mrio	= iostat[FS_META_READ_IO];
-		__entry->fs_discard	= iostat[FS_DISCARD_IO];
+		__entry->fs_discard	= iostat[FS_DISCARD];
 	),
 
 	TP_printk("dev = (%d,%d), "
@@ -2083,33 +2003,33 @@ TRACE_EVENT(f2fs_iostat_latency,
 
 	TP_fast_assign(
 		__entry->dev		= sbi->sb->s_dev;
-		__entry->d_rd_peak	= iostat_lat[READ_IO][DATA].peak_lat;
-		__entry->d_rd_avg	= iostat_lat[READ_IO][DATA].avg_lat;
-		__entry->d_rd_cnt	= iostat_lat[READ_IO][DATA].cnt;
-		__entry->n_rd_peak	= iostat_lat[READ_IO][NODE].peak_lat;
-		__entry->n_rd_avg	= iostat_lat[READ_IO][NODE].avg_lat;
-		__entry->n_rd_cnt	= iostat_lat[READ_IO][NODE].cnt;
-		__entry->m_rd_peak	= iostat_lat[READ_IO][META].peak_lat;
-		__entry->m_rd_avg	= iostat_lat[READ_IO][META].avg_lat;
-		__entry->m_rd_cnt	= iostat_lat[READ_IO][META].cnt;
-		__entry->d_wr_s_peak	= iostat_lat[WRITE_SYNC_IO][DATA].peak_lat;
-		__entry->d_wr_s_avg	= iostat_lat[WRITE_SYNC_IO][DATA].avg_lat;
-		__entry->d_wr_s_cnt	= iostat_lat[WRITE_SYNC_IO][DATA].cnt;
-		__entry->n_wr_s_peak	= iostat_lat[WRITE_SYNC_IO][NODE].peak_lat;
-		__entry->n_wr_s_avg	= iostat_lat[WRITE_SYNC_IO][NODE].avg_lat;
-		__entry->n_wr_s_cnt	= iostat_lat[WRITE_SYNC_IO][NODE].cnt;
-		__entry->m_wr_s_peak	= iostat_lat[WRITE_SYNC_IO][META].peak_lat;
-		__entry->m_wr_s_avg	= iostat_lat[WRITE_SYNC_IO][META].avg_lat;
-		__entry->m_wr_s_cnt	= iostat_lat[WRITE_SYNC_IO][META].cnt;
-		__entry->d_wr_as_peak	= iostat_lat[WRITE_ASYNC_IO][DATA].peak_lat;
-		__entry->d_wr_as_avg	= iostat_lat[WRITE_ASYNC_IO][DATA].avg_lat;
-		__entry->d_wr_as_cnt	= iostat_lat[WRITE_ASYNC_IO][DATA].cnt;
-		__entry->n_wr_as_peak	= iostat_lat[WRITE_ASYNC_IO][NODE].peak_lat;
-		__entry->n_wr_as_avg	= iostat_lat[WRITE_ASYNC_IO][NODE].avg_lat;
-		__entry->n_wr_as_cnt	= iostat_lat[WRITE_ASYNC_IO][NODE].cnt;
-		__entry->m_wr_as_peak	= iostat_lat[WRITE_ASYNC_IO][META].peak_lat;
-		__entry->m_wr_as_avg	= iostat_lat[WRITE_ASYNC_IO][META].avg_lat;
-		__entry->m_wr_as_cnt	= iostat_lat[WRITE_ASYNC_IO][META].cnt;
+		__entry->d_rd_peak	= iostat_lat[0][DATA].peak_lat;
+		__entry->d_rd_avg	= iostat_lat[0][DATA].avg_lat;
+		__entry->d_rd_cnt	= iostat_lat[0][DATA].cnt;
+		__entry->n_rd_peak	= iostat_lat[0][NODE].peak_lat;
+		__entry->n_rd_avg	= iostat_lat[0][NODE].avg_lat;
+		__entry->n_rd_cnt	= iostat_lat[0][NODE].cnt;
+		__entry->m_rd_peak	= iostat_lat[0][META].peak_lat;
+		__entry->m_rd_avg	= iostat_lat[0][META].avg_lat;
+		__entry->m_rd_cnt	= iostat_lat[0][META].cnt;
+		__entry->d_wr_s_peak	= iostat_lat[1][DATA].peak_lat;
+		__entry->d_wr_s_avg	= iostat_lat[1][DATA].avg_lat;
+		__entry->d_wr_s_cnt	= iostat_lat[1][DATA].cnt;
+		__entry->n_wr_s_peak	= iostat_lat[1][NODE].peak_lat;
+		__entry->n_wr_s_avg	= iostat_lat[1][NODE].avg_lat;
+		__entry->n_wr_s_cnt	= iostat_lat[1][NODE].cnt;
+		__entry->m_wr_s_peak	= iostat_lat[1][META].peak_lat;
+		__entry->m_wr_s_avg	= iostat_lat[1][META].avg_lat;
+		__entry->m_wr_s_cnt	= iostat_lat[1][META].cnt;
+		__entry->d_wr_as_peak	= iostat_lat[2][DATA].peak_lat;
+		__entry->d_wr_as_avg	= iostat_lat[2][DATA].avg_lat;
+		__entry->d_wr_as_cnt	= iostat_lat[2][DATA].cnt;
+		__entry->n_wr_as_peak	= iostat_lat[2][NODE].peak_lat;
+		__entry->n_wr_as_avg	= iostat_lat[2][NODE].avg_lat;
+		__entry->n_wr_as_cnt	= iostat_lat[2][NODE].cnt;
+		__entry->m_wr_as_peak	= iostat_lat[2][META].peak_lat;
+		__entry->m_wr_as_avg	= iostat_lat[2][META].avg_lat;
+		__entry->m_wr_as_cnt	= iostat_lat[2][META].cnt;
 	),
 
 	TP_printk("dev = (%d,%d), "

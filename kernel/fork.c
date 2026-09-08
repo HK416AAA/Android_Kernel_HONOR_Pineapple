@@ -94,14 +94,11 @@
 #include <linux/thread_info.h>
 #include <linux/stackleak.h>
 #include <linux/kasan.h>
+#include <linux/randomize_kstack.h>
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/bpf.h>
 #include <linux/tick.h>
-#include <linux/cpufreq_times.h>
-#ifdef CONFIG_XRECLAIMER
-#include <linux/xreclaimer.h>
-#endif
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -109,26 +106,10 @@
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-#include <linux/debugfs.h>
-#endif
-
 #include <trace/events/sched.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
-
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/sched.h>
-
-#ifdef CONFIG_HN_QOS_THREAD
-#include <linux/sched/hwqos/hwqos_common.h>
-#include <linux/sched/hwqos/hwqos_fork.h>
-#endif
-
-#ifdef CONFIG_RECLAIM_ACCT
-#include <linux/mm/reclaim_acct.h>
-#endif
 
 /*
  * Minimum number of threads to boot the kernel
@@ -139,9 +120,6 @@
  * Maximum number of threads
  */
 #define MAX_THREADS FUTEX_TID_MASK
-
-EXPORT_TRACEPOINT_SYMBOL_GPL(task_newtask);
-EXPORT_TRACEPOINT_SYMBOL_GPL(task_rename);
 
 /*
  * Protected counters by write_lock_irq(&tasklist_lock)
@@ -163,7 +141,6 @@ static const char * const resident_page_types[] = {
 DEFINE_PER_CPU(unsigned long, process_counts) = 0;
 
 __cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */
-EXPORT_SYMBOL_GPL(tasklist_lock);
 
 #ifdef CONFIG_PROVE_RCU
 int lockdep_tasklist_lock_is_held(void)
@@ -234,26 +211,23 @@ static bool try_release_thread_stack_to_cache(struct vm_struct *vm)
 	}
 	return false;
 }
-#ifndef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
+
 static void thread_stack_free_rcu(struct rcu_head *rh)
 {
 	struct vm_stack *vm_stack = container_of(rh, struct vm_stack, rcu);
 
 	if (try_release_thread_stack_to_cache(vm_stack->stack_vm_area))
 		return;
+
 	vfree(vm_stack);
 }
-#endif
+
 static void thread_stack_delayed_free(struct task_struct *tsk)
 {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-	vfree_vm_area_atomic(tsk->stack_vm_area);
-#else
 	struct vm_stack *vm_stack = tsk->stack;
 
 	vm_stack->stack_vm_area = tsk->stack_vm_area;
 	call_rcu(&vm_stack->rcu, thread_stack_free_rcu);
-#endif
 }
 
 static int free_vm_stack_cache(unsigned int cpu)
@@ -267,298 +241,12 @@ static int free_vm_stack_cache(unsigned int cpu)
 		if (!vm_stack)
 			continue;
 
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-		vfree_vm_area(vm_stack);
-#else
 		vfree(vm_stack->addr);
-#endif
 		cached_vm_stacks[i] = NULL;
 	}
 
 	return 0;
 }
-
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-struct vmap_stack_page_pool {
-	int nr_available;
-	struct page *cached;
-};
-
-#define PF_VMAP_STACK_FILLING_POOL PF__HOLE__00010000
-
-#define VMAP_STACK_POOL_NR_PAGES (THREAD_SIZE / PAGE_SIZE * 4)
-
-DEFINE_PER_CPU(struct vmap_stack_page_pool, vmap_stack_pg_pool);
-unsigned int vmap_stack_init_page_number = THREAD_SIZE / PAGE_SIZE;
-
-unsigned long vmap_stack_not_used(struct task_struct *tsk)
-{
-	struct vm_struct *vm = task_stack_vm_area(tsk);
-	unsigned long not_used = 0;
-	unsigned int i;
-	unsigned long *data;
-	int k;
-
-	for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-		if (vm->pages[i] == NULL) {
-			not_used += PAGE_SIZE;
-			continue;
-		}
-
-		data = (unsigned long *)(tsk->stack + not_used);
-		for (k = 0; k < PAGE_SIZE / sizeof(*data); k++) {
-			if (data[k] != 0) {
-				return not_used;
-			}
-			not_used += sizeof(*data);
-		}
-	}
-	return not_used;
-}
-
-static int vmap_stack_page_available(void)
-{
-	struct vmap_stack_page_pool *pool;
-	int nr_avail;
-
-	preempt_disable();
-	pool = this_cpu_ptr(&vmap_stack_pg_pool);
-	nr_avail = pool->nr_available;
-	preempt_enable();
-
-	return nr_avail;
-}
-
-static struct page *vmap_stack_get_page(void)
-{
-	struct vmap_stack_page_pool *pool;
-	struct page *page = NULL;
-
-	preempt_disable();
-	pool = this_cpu_ptr(&vmap_stack_pg_pool);
-	if (pool->nr_available > 0 && pool->cached != NULL) {
-		page = pool->cached;
-		pool->cached = (struct page *)page->lru.next;
-		--pool->nr_available;
-	}
-	preempt_enable();
-	return page;
-}
-
-int vmap_stack_fill_page_pool(struct vmap_stack_page_pool *pool, int cpu)
-{
-	int nr_avail = 0;
-	int nr_pages = 0;
-	gfp_t gfp = THREADINFO_GFP & ~(__GFP_ACCOUNT | __GFP_IO | __GFP_FS);
-	unsigned long flags;
-
-	pr_debug("vmap_stack_fill begin: avail %d\n", pool->nr_available);
-	while (nr_avail < VMAP_STACK_POOL_NR_PAGES) {
-		/* May be scheduled. Or interrupt, stack access exceptions occur. */
-		struct page *page = alloc_page(GFP_ATOMIC);
-		if (page == NULL) {
-			pr_warn("vmap_stack_fill nomem, avail %d alloc %d\n",
-				pool->nr_available, nr_pages);
-			if (preemptible())
-				page = alloc_page(gfp | __GFP_HIGH);
-			if (page == NULL)
-				break;
-			pr_warn("vmap_stack_fill retry, avail %d alloc %d\n",
-				pool->nr_available, nr_pages + 1);
-		}
-
-		local_irq_save(flags);
-		if (smp_processor_id() == cpu) {
-			/* No interrupt and stack access exceptions here. */
-			page->lru.next = (struct list_head *)pool->cached;
-			pool->cached = page;
-			nr_avail = ++pool->nr_available;
-			++nr_pages;
-			page = NULL;
-		}
-		local_irq_restore(flags);
-		if (page) {
-			__free_page(page); /* Maybe interrupt exceptions etc. */
-			pr_warn("vmap_stack_fill %d migrated, avail %d alloc %d\n",
-				cpu, pool->nr_available, nr_pages);
-			break;
-		}
-	}
-	pr_debug("vmap_stack_fill end: avail %d alloc %d\n",
-			pool->nr_available, nr_pages);
-	return nr_pages > 0 ? 0 : -ENOMEM;
-}
-
-void vmap_stack_check_page_pool(int cpu_input)
-{
-	struct vmap_stack_page_pool *pool;
-
-	pool = per_cpu_ptr(&vmap_stack_pg_pool, cpu_input);
-	if (pool->nr_available >= VMAP_STACK_POOL_NR_PAGES)
-		return;
-
-	if (!(current->flags & PF_VMAP_STACK_FILLING_POOL)) {
-		/* Set filling to prevent nesting. */
-		current->flags |= PF_VMAP_STACK_FILLING_POOL;
-		vmap_stack_fill_page_pool(pool, cpu_input);
-		current->flags &= ~PF_VMAP_STACK_FILLING_POOL;
-	}
-}
-
-#ifdef CONFIG_SYSCTL
-int proc_stack_page_init_number_handler(struct ctl_table *table, int write,
-			void *buffer, size_t *length, loff_t *ppos)
-{
-	int ret = 0;
-
-	if (kasan_enabled())
-		return -EPERM;
-	ret = proc_douintvec_minmax(table, write, buffer, length, ppos);
-
-	return ret;
-}
-#endif /* CONFIG_SYSCTL */
-
-#ifdef CONFIG_DEBUG_FS
-static int vmap_stack_test_func(long *arg, long depth)
-{
-	long stk_data[sizeof(long)];
-	int pid_nr = task_pid_nr(current);
-	long timeout = (depth * pid_nr) % HZ + 1;
-
-	memcpy(stk_data, arg, sizeof(stk_data));
-
-	pr_warn("vmap_stack_test %u begin depth %ld data %px",
-			pid_nr, depth, stk_data);
-	schedule_timeout(timeout);
-	if (depth > 0) {
-		vmap_stack_test_func(stk_data, depth - 1);
-	}
-	schedule_timeout(timeout);
-	pr_warn("vmap_stack_test %u end depth %ld data %px",
-			pid_nr, depth, stk_data);
-	return depth;
-}
-
-static int vmap_stack_test_thread(void *arg)
-{
-	long depth = (long)arg;
-	long stk_data[sizeof(long)] = { 0 };
-
-	vmap_stack_test_func(stk_data, depth);
-	return 0;
-}
-
-static ssize_t vmap_stack_test_write(struct file *file,
-			const char __user *buf, size_t len, loff_t *ppos)
-{
-	long nr_threads = 1;
-	long depth = 1;
-	long i;
-	struct task_struct *p;
-	char kbuf[64];
-	size_t size;
-
-	size = min(sizeof(kbuf) - 1, len);
-	if (copy_from_user(kbuf, buf, size))
-		return -EFAULT;
-
-	if (sscanf(kbuf, "threads:%lu depth:%lu", &nr_threads, &depth) != 2)
-		return -EINVAL;
-
-	for (i = 0; i < nr_threads; i++) {
-		p = kthread_create(vmap_stack_test_thread, (void *)depth,
-				"vstk_tst_%ld", i);
-		if (IS_ERR(p)) {
-			pr_warn("vmap_stack_test create thread %ld failed", i);
-			break;
-		}
-		wake_up_process(p);
-	}
-	return len;
-}
-
-struct file_operations vmap_stack_test_fops = {
-	.write = vmap_stack_test_write,
-};
-
-static int __init vmap_stack_init_debugfs(void)
-{
-	struct dentry *vmap_stack_dir;
-
-	vmap_stack_dir = debugfs_create_dir("vmap_stack", NULL);
-	if (!vmap_stack_dir) {
-		pr_err("failed to create vmap stack\n");
-		return -ENOMEM;
-	}
-	debugfs_create_file("test_stack_on_demand", 0200,
-			vmap_stack_dir, NULL, &vmap_stack_test_fops);
-	return 0;
-}
-subsys_initcall(vmap_stack_init_debugfs);
-#endif
-
-int vmap_stack_alloc_page_atomic(struct task_struct *tsk,
-			unsigned long addr)
-{
-	struct page* page;
-	struct vm_struct *vm = task_stack_vm_area(tsk);
-	int index;
-	int ret;
-
-	if (vm == NULL)
-		return -EINVAL;
-
-	/* Spin operation cannot be used in el1 exception context. */
-	index = (addr - (unsigned long)tsk->stack) >> PAGE_SHIFT;
-	pr_debug("vmap_stack_alloc_page_atomic page[%d]@0x%lx for 0x%lx\n",
-			index, (unsigned long)(tsk->stack), addr);
-	if (index >= vm->nr_pages)
-		return -EINVAL;
-
-	page = vmap_stack_get_page();
-	if (page == NULL) {
-		pr_err("vmap_stack_alloc_page_atomic page[%d] for 0x%lx nomem\n", index, addr);
-		return -ENOMEM;
-	}
-	ret = vmalloc_map_page_atomic(vm, index, page);
-	if (ret < 0) {
-		pr_err("vmap_stack_alloc_page_atomic page[%d] for 0x%lx ret %d\n", index, addr, ret);
-		__free_page(page);
-		return ret;
-	}
-
-	mod_lruvec_page_state(page, NR_KERNEL_STACK_KB, PAGE_SIZE / 1024);
-	return 0;
-}
-
-static void *vmap_stack_alloc(int node, const void *caller)
-{
-	unsigned long size = THREAD_SIZE;
-	unsigned long align = THREAD_ALIGN;
-	unsigned int vm_begin_page = 0;
-	unsigned int vm_nr_pages = THREAD_SIZE / PAGE_SIZE;
-	unsigned int init_page_begin = 0;
-	unsigned int init_page_end = THREAD_SIZE / PAGE_SIZE;
-	unsigned int init_begin = init_page_end - vmap_stack_init_page_number;
-
-	if (0 < init_begin && init_begin < init_page_end &&
-		vmap_stack_page_available() >= init_begin) {
-		vm_begin_page = THREAD_ALIGN / PAGE_SIZE - init_begin;
-		size = THREAD_SIZE + vm_begin_page * PAGE_SIZE;
-		init_page_begin = init_begin;
-		align = THREAD_ALIGN * 2;
-	}
-
-	return __vmalloc_init_range(size, align,
-				vm_begin_page, vm_nr_pages,
-				init_page_begin, init_page_end,
-				VMALLOC_START, VMALLOC_END,
-				THREADINFO_GFP & ~__GFP_ACCOUNT,
-				PAGE_KERNEL,
-				0, node, caller);
-}
-#endif
 
 static int memcg_charge_kernel_stack(struct vm_struct *vm)
 {
@@ -569,11 +257,6 @@ static int memcg_charge_kernel_stack(struct vm_struct *vm)
 	BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
 
 	for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-			if (vm->pages[i] == NULL)
-				continue;
-#endif
-
 		ret = memcg_kmem_charge_page(vm->pages[i], GFP_KERNEL, 0);
 		if (ret)
 			goto err;
@@ -610,17 +293,10 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 		stack = kasan_reset_tag(s->addr);
 
 		/* Clear stale pointers from reused stack. */
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-		zero_vm_area(s);
-#else
 		memset(stack, 0, THREAD_SIZE);
-#endif
+
 		if (memcg_charge_kernel_stack(s)) {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-			vfree_vm_area(s);
-#else
 			vfree(s->addr);
-#endif
 			return -ENOMEM;
 		}
 
@@ -634,25 +310,17 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	 * so memcg accounting is performed manually on assigning/releasing
 	 * stacks to tasks. Drop __GFP_ACCOUNT.
 	 */
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-	stack = vmap_stack_alloc(node, __builtin_return_address(0));
-#else
 	stack = __vmalloc_node_range(THREAD_SIZE, THREAD_ALIGN,
 				     VMALLOC_START, VMALLOC_END,
 				     THREADINFO_GFP & ~__GFP_ACCOUNT,
 				     PAGE_KERNEL,
 				     0, node, __builtin_return_address(0));
-#endif
 	if (!stack)
 		return -ENOMEM;
 
 	vm = find_vm_area(stack);
 	if (memcg_charge_kernel_stack(vm)) {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-		vfree_vm_area(vm);
-#else
 		vfree(stack);
-#endif
 		return -ENOMEM;
 	}
 	/*
@@ -668,15 +336,6 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 
 static void free_thread_stack(struct task_struct *tsk)
 {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-	struct vm_struct *vm = task_stack_vm_area(tsk);
-	if (__vm_area_get_allcated_pages(vm) > vmap_stack_init_page_number) {
-		vfree_vm_area_atomic(vm);
-		tsk->stack = NULL;
-		tsk->stack_vm_area = NULL;
-		return;
-	}
-#endif
 	if (!try_release_thread_stack_to_cache(tsk->stack_vm_area))
 		thread_stack_delayed_free(tsk);
 
@@ -794,49 +453,13 @@ static struct kmem_cache *vm_area_cachep;
 /* SLAB cache for mm_struct structures (tsk->mm) */
 static struct kmem_cache *mm_cachep;
 
-#ifdef CONFIG_PER_VMA_LOCK
-
-/* SLAB cache for vm_area_struct.lock */
-static struct kmem_cache *vma_lock_cachep;
-
-static bool vma_lock_alloc(struct vm_area_struct *vma)
-{
-	vma->vm_lock = kmem_cache_alloc(vma_lock_cachep, GFP_KERNEL);
-	if (!vma->vm_lock)
-		return false;
-
-	init_rwsem(&vma->vm_lock->lock);
-	vma->vm_lock_seq = -1;
-
-	return true;
-}
-
-static inline void vma_lock_free(struct vm_area_struct *vma)
-{
-	kmem_cache_free(vma_lock_cachep, vma->vm_lock);
-}
-
-#else /* CONFIG_PER_VMA_LOCK */
-
-static inline bool vma_lock_alloc(struct vm_area_struct *vma) { return true; }
-static inline void vma_lock_free(struct vm_area_struct *vma) {}
-
-#endif /* CONFIG_PER_VMA_LOCK */
-
 struct vm_area_struct *vm_area_alloc(struct mm_struct *mm)
 {
 	struct vm_area_struct *vma;
 
 	vma = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
-	if (!vma)
-		return NULL;
-
-	vma_init(vma, mm);
-	if (!vma_lock_alloc(vma)) {
-		kmem_cache_free(vm_area_cachep, vma);
-		return NULL;
-	}
-
+	if (vma)
+		vma_init(vma, mm);
 	return vma;
 }
 
@@ -844,52 +467,24 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
 {
 	struct vm_area_struct *new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
 
-	if (!new)
-		return NULL;
-
-	ASSERT_EXCLUSIVE_WRITER(orig->vm_flags);
-	ASSERT_EXCLUSIVE_WRITER(orig->vm_file);
-	/*
-	 * orig->shared.rb may be modified concurrently, but the clone
-	 * will be reinitialized.
-	 */
-	data_race(memcpy(new, orig, sizeof(*new)));
-	if (!vma_lock_alloc(new)) {
-		kmem_cache_free(vm_area_cachep, new);
-		return NULL;
+	if (new) {
+		ASSERT_EXCLUSIVE_WRITER(orig->vm_flags);
+		ASSERT_EXCLUSIVE_WRITER(orig->vm_file);
+		/*
+		 * orig->shared.rb may be modified concurrently, but the clone
+		 * will be reinitialized.
+		 */
+		*new = data_race(*orig);
+		INIT_LIST_HEAD(&new->anon_vma_chain);
+		dup_anon_vma_name(orig, new);
 	}
-	INIT_LIST_HEAD(&new->anon_vma_chain);
-	dup_anon_vma_name(orig, new);
-
 	return new;
 }
 
-void __vm_area_free(struct vm_area_struct *vma)
-{
-	free_anon_vma_name(vma);
-	vma_lock_free(vma);
-	kmem_cache_free(vm_area_cachep, vma);
-}
-
-#ifdef CONFIG_PER_VMA_LOCK
-static void vm_area_free_rcu_cb(struct rcu_head *head)
-{
-	struct vm_area_struct *vma = container_of(head, struct vm_area_struct,
-						  vm_rcu);
-
-	/* The vma should not be locked while being destroyed. */
-	VM_BUG_ON_VMA(rwsem_is_locked(&vma->vm_lock->lock), vma);
-	__vm_area_free(vma);
-}
-#endif
-
 void vm_area_free(struct vm_area_struct *vma)
 {
-#ifdef CONFIG_PER_VMA_LOCK
-	call_rcu(&vma->vm_rcu, vm_area_free_rcu_cb);
-#else
-	__vm_area_free(vma);
-#endif
+	free_anon_vma_name(vma);
+	kmem_cache_free(vm_area_cachep, vma);
 }
 
 static void account_kernel_stack(struct task_struct *tsk, int account)
@@ -898,18 +493,9 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
 		struct vm_struct *vm = task_stack_vm_area(tsk);
 		int i;
 
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-			if (vm->pages[i] == NULL)
-				continue;
-			mod_lruvec_page_state(vm->pages[i], NR_KERNEL_STACK_KB,
-						account * PAGE_SIZE / 1024);
-		}
-#else
 		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
 			mod_lruvec_page_state(vm->pages[i], NR_KERNEL_STACK_KB,
 					      account * (PAGE_SIZE / 1024));
-#endif
 	} else {
 		void *stack = task_stack_page(tsk);
 
@@ -928,13 +514,8 @@ void exit_task_stack_account(struct task_struct *tsk)
 		int i;
 
 		vm = task_stack_vm_area(tsk);
-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-#ifdef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
-			if (vm->pages[i] == NULL)
-				continue;
-#endif
+		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
 			memcg_kmem_uncharge_page(vm->pages[i], 0);
-		}
 	}
 }
 
@@ -959,11 +540,9 @@ void free_task(struct task_struct *tsk)
 #ifdef CONFIG_SECCOMP
 	WARN_ON_ONCE(tsk->seccomp.filter);
 #endif
-	cpufreq_task_times_exit(tsk);
 	release_user_cpus_ptr(tsk);
 	scs_release(tsk);
 
-	trace_android_vh_free_task(tsk);
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 	/*
 	 * The task is finally done with both the stack and thread_info,
@@ -997,8 +576,8 @@ static void dup_mm_exe_file(struct mm_struct *mm, struct mm_struct *oldmm)
 	 * We depend on the oldmm having properly denied write access to the
 	 * exe_file already.
 	 */
-	if (exe_file && deny_write_access(exe_file))
-		pr_warn_once("deny_write_access() failed in %s\n", __func__);
+	if (exe_file && exe_file_deny_write_access(exe_file))
+		pr_warn_once("exe_file_deny_write_access() failed in %s\n", __func__);
 }
 
 #ifdef CONFIG_MMU
@@ -1009,6 +588,7 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	int retval;
 	unsigned long charge = 0;
 	LIST_HEAD(uf);
+	MA_STATE(old_mas, &oldmm->mm_mt, 0, 0);
 	MA_STATE(mas, &mm->mm_mt, 0, 0);
 
 	uprobe_start_dup_mmap();
@@ -1036,23 +616,15 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		goto out;
 	khugepaged_fork(mm, oldmm);
 
-	/* Use __mt_dup() to efficiently build an identical maple tree. */
-	retval = __mt_dup(&oldmm->mm_mt, &mm->mm_mt, GFP_KERNEL);
-	if (unlikely(retval))
+	retval = mas_expected_entries(&mas, oldmm->map_count);
+	if (retval)
 		goto out;
 
 	mt_clear_in_rcu(mas.tree);
-	mas_for_each(&mas, mpnt, ULONG_MAX) {
+	mas_for_each(&old_mas, mpnt, ULONG_MAX) {
 		struct file *file;
 
-		vma_start_write(mpnt);
 		if (mpnt->vm_flags & VM_DONTCOPY) {
-			__mas_set_range(&mas, mpnt->vm_start, mpnt->vm_end - 1);
-			mas_store_gfp(&mas, NULL, GFP_KERNEL);
-			if (unlikely(mas_is_err(&mas))) {
-				retval = -ENOMEM;
-				goto loop_out;
-			}
 			vm_stat_account(mm, mpnt->vm_flags, -vma_pages(mpnt));
 			continue;
 		}
@@ -1075,6 +647,11 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		tmp = vm_area_dup(mpnt);
 		if (!tmp)
 			goto fail_nomem;
+
+		/* track_pfn_copy() will later take care of copying internal state. */
+		if (unlikely(tmp->vm_flags & VM_PFNMAP))
+			untrack_pfn_clear(tmp);
+
 		retval = vma_dup_policy(mpnt, tmp);
 		if (retval)
 			goto fail_nomem_policy;
@@ -1091,23 +668,14 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 			tmp->anon_vma = NULL;
 		} else if (anon_vma_fork(tmp, mpnt))
 			goto fail_nomem_anon_vma_fork;
-		vm_flags_clear(tmp, VM_LOCKED_MASK);
-		/*
-		 * Copy/update hugetlb private vma information.
-		 */
-		if (is_vm_hugetlb_page(tmp))
-			hugetlb_dup_vma_private(tmp);
-
-		if (tmp->vm_ops && tmp->vm_ops->open)
-			tmp->vm_ops->open(tmp);
-
+		tmp->vm_flags &= ~(VM_LOCKED | VM_LOCKONFAULT);
 		file = tmp->vm_file;
 		if (file) {
 			struct address_space *mapping = file->f_mapping;
 
 			get_file(file);
 			i_mmap_lock_write(mapping);
-			if (tmp->vm_flags & VM_SHARED)
+			if (vma_is_shared_maywrite(tmp))
 				mapping_allow_writable(mapping);
 			flush_dcache_mmap_lock(mapping);
 			/* insert tmp into the share list, just after mpnt */
@@ -1118,39 +686,34 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		}
 
 		/*
-		 * Link the vma into the MT. After using __mt_dup(), memory
-		 * allocation is not necessary here, so it cannot fail.
+		 * Copy/update hugetlb private vma information.
 		 */
+		if (is_vm_hugetlb_page(tmp))
+			hugetlb_dup_vma_private(tmp);
+
+		/* Link the vma into the MT */
 		mas.index = tmp->vm_start;
 		mas.last = tmp->vm_end - 1;
 		mas_store(&mas, tmp);
+		if (mas_is_err(&mas))
+			goto fail_nomem_mas_store;
 
 		mm->map_count++;
 		if (!(tmp->vm_flags & VM_WIPEONFORK))
 			retval = copy_page_range(tmp, mpnt);
 
-		if (retval) {
-			mpnt = mas_find(&mas, ULONG_MAX);
+		if (tmp->vm_ops && tmp->vm_ops->open)
+			tmp->vm_ops->open(tmp);
+
+		if (retval)
 			goto loop_out;
-		}
 	}
 	/* a new mm has just been created */
 	retval = arch_dup_mmap(oldmm, mm);
 loop_out:
 	mas_destroy(&mas);
-	if (!retval) {
+	if (!retval)
 		mt_set_in_rcu(mas.tree);
-	} else if (mpnt) {
-		/*
-		 * The entire maple tree has already been duplicated. If the
-		 * mmap duplication fails, mark the failure point with
-		 * XA_ZERO_ENTRY. In exit_mmap(), if this marker is encountered,
-		 * stop releasing VMAs that have not been duplicated after this
-		 * point.
-		 */
-		mas_set_range(&mas, mpnt->vm_start, mpnt->vm_end - 1);
-		mas_store(&mas, XA_ZERO_ENTRY);
-	}
 out:
 	mmap_write_unlock(mm);
 	flush_tlb_mm(oldmm);
@@ -1160,6 +723,8 @@ fail_uprobe_end:
 	uprobe_end_dup_mmap();
 	return retval;
 
+fail_nomem_mas_store:
+	unlink_anon_vmas(tmp);
 fail_nomem_anon_vma_fork:
 	mpol_put(vma_policy(tmp));
 fail_nomem_policy:
@@ -1281,10 +846,6 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(!tsk->exit_state);
 	WARN_ON(refcount_read(&tsk->usage));
 	WARN_ON(tsk == current);
-
-#ifdef CONFIG_HN_QOS_THREAD
-	release_task_qos_info(tsk);
-#endif
 
 	io_uring_free(tsk);
 	cgroup_free(tsk);
@@ -1410,12 +971,10 @@ int __weak arch_dup_task_struct(struct task_struct *dst,
 
 void set_task_stack_end_magic(struct task_struct *tsk)
 {
-#ifndef CONFIG_ALLOC_STACK_PAGE_ON_DEMAND
 	unsigned long *stackend;
 
 	stackend = end_of_stack(tsk);
 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
-#endif
 }
 
 static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
@@ -1509,10 +1068,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->reported_split_lock = 0;
 #endif
 
-	android_init_vendor_data(tsk, 1);
-	android_init_oem_data(tsk, 1);
-
-	trace_android_vh_dup_task_struct(tsk, orig);
+#ifdef CONFIG_BPF_SYSCALL
+	RCU_INIT_POINTER(tsk->bpf_storage, NULL);
+	tsk->bpf_ctx = NULL;
+#endif
 	return tsk;
 
 free_stack:
@@ -1580,9 +1139,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	seqcount_init(&mm->write_protect_seq);
 	mmap_init_lock(mm);
 	INIT_LIST_HEAD(&mm->mmlist);
-#ifdef CONFIG_PER_VMA_LOCK
-	mm->mm_lock_seq = 0;
-#endif
 	mm_pgtables_bytes_init(mm);
 	mm->map_count = 0;
 	mm->locked_vm = 0;
@@ -1596,9 +1152,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_pasid_init(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
 	mmu_notifier_subscriptions_init(mm);
-#ifdef CONFIG_XRECLAIMER
-	xreclaimer_mm_init(mm);
-#endif
 	init_tlb_flush_pending(mm);
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
 	mm->pmd_huge_pte = NULL;
@@ -1675,10 +1228,8 @@ void mmput(struct mm_struct *mm)
 {
 	might_sleep();
 
-	if (atomic_dec_and_test(&mm->mm_users)) {
-		trace_android_vh_mmput(mm);
+	if (atomic_dec_and_test(&mm->mm_users))
 		__mmput(mm);
-	}
 }
 EXPORT_SYMBOL_GPL(mmput);
 
@@ -1728,13 +1279,13 @@ int set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
 		 * We expect the caller (i.e., sys_execve) to already denied
 		 * write access, so this is unlikely to fail.
 		 */
-		if (unlikely(deny_write_access(new_exe_file)))
+		if (unlikely(exe_file_deny_write_access(new_exe_file)))
 			return -EACCES;
 		get_file(new_exe_file);
 	}
 	rcu_assign_pointer(mm->exe_file, new_exe_file);
 	if (old_exe_file) {
-		allow_write_access(old_exe_file);
+		exe_file_allow_write_access(old_exe_file);
 		fput(old_exe_file);
 	}
 	return 0;
@@ -1776,7 +1327,7 @@ int replace_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
 	}
 
 	/* set the new file, lockless */
-	ret = deny_write_access(new_exe_file);
+	ret = exe_file_deny_write_access(new_exe_file);
 	if (ret)
 		return -EACCES;
 	get_file(new_exe_file);
@@ -1788,7 +1339,7 @@ int replace_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
 		 * write access while someone might open the file writable.
 		 */
 		mmap_read_lock(mm);
-		allow_write_access(old_exe_file);
+		exe_file_allow_write_access(old_exe_file);
 		fput(old_exe_file);
 		mmap_read_unlock(mm);
 	}
@@ -1871,8 +1422,9 @@ struct mm_struct *mm_access(struct task_struct *task, unsigned int mode)
 		return ERR_PTR(err);
 
 	mm = get_task_mm(task);
-	if (mm && mm != current->mm &&
-			!ptrace_may_access(task, mode)) {
+	if (!mm) {
+		mm = ERR_PTR(-ESRCH);
+	} else if (mm != current->mm && !ptrace_may_access(task, mode)) {
 		mmput(mm);
 		mm = ERR_PTR(-EACCES);
 	}
@@ -2045,9 +1597,6 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 	if (clone_flags & CLONE_VM) {
 		mmget(oldmm);
 		mm = oldmm;
-#ifdef CONFIG_XRECLAIMER
-		xreclaimer_inc_mm_tasks(mm);
-#endif
 	} else {
 		mm = dup_mm(tsk, current->mm);
 		if (!mm)
@@ -2103,7 +1652,7 @@ static int copy_files(unsigned long clone_flags, struct task_struct *tsk)
 	return 0;
 }
 
-static int copy_sighand(unsigned long clone_flags, struct task_struct *tsk)
+static int copy_sighand(u64 clone_flags, struct task_struct *tsk)
 {
 	struct sighand_struct *sig;
 
@@ -2191,9 +1740,7 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 	task_unlock(current->group_leader);
 
 	posix_cpu_timers_init_group(sig);
-#ifdef CONFIG_HN_DIE_CATCH
-	sig->unexpected_die_catch_flags = 0; /* all new child don't inherit it */
-#endif
+
 	tty_audit_fork(sig);
 	sched_autogroup_fork(sig);
 
@@ -2407,6 +1954,91 @@ const struct file_operations pidfd_fops = {
 #endif
 };
 
+/**
+ * __pidfd_prepare - allocate a new pidfd_file and reserve a pidfd
+ * @pid:   the struct pid for which to create a pidfd
+ * @flags: flags of the new @pidfd
+ * @pidfd: the pidfd to return
+ *
+ * Allocate a new file that stashes @pid and reserve a new pidfd number in the
+ * caller's file descriptor table. The pidfd is reserved but not installed yet.
+
+ * The helper doesn't perform checks on @pid which makes it useful for pidfds
+ * created via CLONE_PIDFD where @pid has no task attached when the pidfd and
+ * pidfd file are prepared.
+ *
+ * If this function returns successfully the caller is responsible to either
+ * call fd_install() passing the returned pidfd and pidfd file as arguments in
+ * order to install the pidfd into its file descriptor table or they must use
+ * put_unused_fd() and fput() on the returned pidfd and pidfd file
+ * respectively.
+ *
+ * This function is useful when a pidfd must already be reserved but there
+ * might still be points of failure afterwards and the caller wants to ensure
+ * that no pidfd is leaked into its file descriptor table.
+ *
+ * Return: On success, a reserved pidfd is returned from the function and a new
+ *         pidfd file is returned in the last argument to the function. On
+ *         error, a negative error code is returned from the function and the
+ *         last argument remains unchanged.
+ */
+static int __pidfd_prepare(struct pid *pid, unsigned int flags, struct file **ret)
+{
+	int pidfd;
+	struct file *pidfd_file;
+
+	if (flags & ~(O_NONBLOCK | O_RDWR | O_CLOEXEC))
+		return -EINVAL;
+
+	pidfd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
+	if (pidfd < 0)
+		return pidfd;
+
+	pidfd_file = anon_inode_getfile("[pidfd]", &pidfd_fops, pid,
+					flags | O_RDWR | O_CLOEXEC);
+	if (IS_ERR(pidfd_file)) {
+		put_unused_fd(pidfd);
+		return PTR_ERR(pidfd_file);
+	}
+	get_pid(pid); /* held by pidfd_file now */
+	*ret = pidfd_file;
+	return pidfd;
+}
+
+/**
+ * pidfd_prepare - allocate a new pidfd_file and reserve a pidfd
+ * @pid:   the struct pid for which to create a pidfd
+ * @flags: flags of the new @pidfd
+ * @pidfd: the pidfd to return
+ *
+ * Allocate a new file that stashes @pid and reserve a new pidfd number in the
+ * caller's file descriptor table. The pidfd is reserved but not installed yet.
+ *
+ * The helper verifies that @pid is used as a thread group leader.
+ *
+ * If this function returns successfully the caller is responsible to either
+ * call fd_install() passing the returned pidfd and pidfd file as arguments in
+ * order to install the pidfd into its file descriptor table or they must use
+ * put_unused_fd() and fput() on the returned pidfd and pidfd file
+ * respectively.
+ *
+ * This function is useful when a pidfd must already be reserved but there
+ * might still be points of failure afterwards and the caller wants to ensure
+ * that no pidfd is leaked into its file descriptor table.
+ *
+ * Return: On success, a reserved pidfd is returned from the function and a new
+ *         pidfd file is returned in the last argument to the function. On
+ *         error, a negative error code is returned from the function and the
+ *         last argument remains unchanged.
+ */
+int pidfd_prepare(struct pid *pid, unsigned int flags, struct file **ret)
+{
+	if (!pid || !pid_has_task(pid, PIDTYPE_TGID))
+		return -EINVAL;
+
+	return __pidfd_prepare(pid, flags, ret);
+}
+
 static void __delayed_free_task(struct rcu_head *rhp)
 {
 	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
@@ -2473,9 +2105,7 @@ static __latent_entropy struct task_struct *copy_process(
 	struct file *pidfile = NULL;
 	const u64 clone_flags = args->flags;
 	struct nsproxy *nsp = current->nsproxy;
-#ifdef CONFIG_HN_VIP_TO_TA_BUILDIN
-	int vip_ret;
-#endif
+
 	/*
 	 * Don't allow sharing the root directory with processes in a different
 	 * namespace
@@ -2574,8 +2204,6 @@ static __latent_entropy struct task_struct *copy_process(
 		siginitsetinv(&p->blocked, sigmask(SIGKILL)|sigmask(SIGSTOP));
 	}
 
-	cpufreq_task_times_init(p);
-
 	p->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? args->child_tid : NULL;
 	/*
 	 * Clear TID on mm_release()?
@@ -2612,9 +2240,6 @@ static __latent_entropy struct task_struct *copy_process(
 		goto bad_fork_cleanup_count;
 
 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
-#ifdef CONFIG_RECLAIM_ACCT
-	reclaimacct_tsk_init(p);
-#endif
 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
 	p->flags |= PF_FORKNOEXEC;
 	INIT_LIST_HEAD(&p->children);
@@ -2630,10 +2255,6 @@ static __latent_entropy struct task_struct *copy_process(
 	p->utimescaled = p->stimescaled = 0;
 #endif
 	prev_cputime_init(&p->prev_cputime);
-
-#ifdef CONFIG_CPU_FREQ_POWER_STAT
-	p->cpu_power = 0;
-#endif
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
 	seqcount_init(&p->vtime.seqcount);
@@ -2702,10 +2323,6 @@ static __latent_entropy struct task_struct *copy_process(
 	p->sequential_io	= 0;
 	p->sequential_io_avg	= 0;
 #endif
-#ifdef CONFIG_BPF_SYSCALL
-	RCU_INIT_POINTER(p->bpf_storage, NULL);
-	p->bpf_ctx = NULL;
-#endif
 
 	/* Perform scheduler related setup. Assign this task to a CPU. */
 	retval = sched_fork(clone_flags, p);
@@ -2751,6 +2368,7 @@ static __latent_entropy struct task_struct *copy_process(
 	if (retval)
 		goto bad_fork_cleanup_io;
 
+	random_kstack_task_init(p);
 	stackleak_task_init(p);
 
 	if (pid != &init_struct_pid) {
@@ -2768,20 +2386,11 @@ static __latent_entropy struct task_struct *copy_process(
 	 * if the fd table isn't shared).
 	 */
 	if (clone_flags & CLONE_PIDFD) {
-		retval = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
+		/* Note that no task has been attached to @pid yet. */
+		retval = __pidfd_prepare(pid, O_RDWR | O_CLOEXEC, &pidfile);
 		if (retval < 0)
 			goto bad_fork_free_pid;
-
 		pidfd = retval;
-
-		pidfile = anon_inode_getfile("[pidfd]", &pidfd_fops, pid,
-					      O_RDWR | O_CLOEXEC);
-		if (IS_ERR(pidfile)) {
-			put_unused_fd(pidfd);
-			retval = PTR_ERR(pidfile);
-			goto bad_fork_free_pid;
-		}
-		get_pid(pid);	/* held by pidfile now */
 
 		retval = put_user(pidfd, args->pidfd);
 		if (retval)
@@ -2842,12 +2451,6 @@ static __latent_entropy struct task_struct *copy_process(
 	 * between here and cgroup_post_fork() if an organisation operation is in
 	 * progress.
 	 */
-#ifdef CONFIG_HN_VIP_TO_TA_BUILDIN
-	trace_android_vh_honor_check_vip_status(p->pid, p->tgid, p, &vip_ret);
-	if (vip_ret) {
-		args->flags |= CLONE_INTO_TA_CGROUP;
-	}
-#endif
 	retval = cgroup_can_fork(p, args);
 	if (retval)
 		goto bad_fork_put_pidfd;
@@ -2967,7 +2570,6 @@ static __latent_entropy struct task_struct *copy_process(
 		attach_pid(p, PIDTYPE_PID);
 		nr_threads++;
 	}
-	trace_android_vh_copy_process(current, nr_threads, current->signal->nr_threads);
 	total_forks++;
 	hlist_del_init(&delayed.node);
 	spin_unlock(&current->sighand->siglock);
@@ -2978,11 +2580,6 @@ static __latent_entropy struct task_struct *copy_process(
 		fd_install(pidfd, pidfile);
 
 	proc_fork_connector(p);
-
-#ifdef CONFIG_HN_QOS_THREAD
-	iaware_proc_fork_inherit(p, clone_flags);
-#endif
-
 	sched_post_fork(p);
 	cgroup_post_fork(p, args);
 	perf_event_fork(p);
@@ -3170,8 +2767,6 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 
 	if (IS_ERR(p))
 		return PTR_ERR(p);
-
-	cpufreq_task_times_alloc(p);
 
 	/*
 	 * Do this prior waking up the new thread - the thread pointer
@@ -3553,9 +3148,6 @@ void __init proc_caches_init(void)
 			NULL);
 
 	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC|SLAB_ACCOUNT);
-#ifdef CONFIG_PER_VMA_LOCK
-	vma_lock_cachep = KMEM_CACHE(vma_lock, SLAB_PANIC|SLAB_ACCOUNT);
-#endif
 	mmap_init();
 	nsproxy_cache_init();
 }
@@ -3604,7 +3196,7 @@ static int unshare_fs(unsigned long unshare_flags, struct fs_struct **new_fsp)
 		return 0;
 
 	/* don't need lock here; in the worst case we'll do useless copy */
-	if (fs->users == 1)
+	if (!(unshare_flags & CLONE_NEWNS) && fs->users == 1)
 		return 0;
 
 	*new_fsp = copy_fs_struct(fs);
@@ -3694,11 +3286,10 @@ int ksys_unshare(unsigned long unshare_flags)
 					 new_cred, new_fs);
 	if (err)
 		goto bad_unshare_cleanup_cred;
-
 	if (new_cred) {
 		err = set_cred_ucounts(new_cred);
 		if (err)
-			goto bad_unshare_cleanup_cred;
+			goto bad_unshare_cleanup_nsproxy;
 	}
 
 	if (new_fs || new_fd || do_sysvsem || new_cred || new_nsproxy) {
@@ -3714,8 +3305,10 @@ int ksys_unshare(unsigned long unshare_flags)
 			shm_init_task(current);
 		}
 
-		if (new_nsproxy)
+		if (new_nsproxy) {
 			switch_task_namespaces(current, new_nsproxy);
+			new_nsproxy = NULL;
+		}
 
 		task_lock(current);
 
@@ -3744,13 +3337,15 @@ int ksys_unshare(unsigned long unshare_flags)
 
 	perf_event_namespaces(current);
 
+bad_unshare_cleanup_nsproxy:
+	if (new_nsproxy)
+		put_nsproxy(new_nsproxy);
 bad_unshare_cleanup_cred:
 	if (new_cred)
 		put_cred(new_cred);
 bad_unshare_cleanup_fd:
 	if (new_fd)
 		put_files_struct(new_fd);
-
 bad_unshare_cleanup_fs:
 	if (new_fs)
 		free_fs_struct(new_fs);

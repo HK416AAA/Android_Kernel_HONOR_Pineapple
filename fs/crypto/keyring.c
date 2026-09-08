@@ -64,24 +64,26 @@ static void fscrypt_free_master_key(struct rcu_head *head)
 	kfree_sensitive(mk);
 }
 
+static void clear_mk_users(struct fscrypt_master_key *mk);
+
 void fscrypt_put_master_key(struct fscrypt_master_key *mk)
 {
 	if (!refcount_dec_and_test(&mk->mk_struct_refs))
 		return;
 	/*
-	 * No structural references left, so free ->mk_users, and also free the
+	 * No structural references left, so clear ->mk_users, and also free the
 	 * fscrypt_master_key struct itself after an RCU grace period ensures
 	 * that concurrent keyring lookups can no longer find it.
 	 */
-	WARN_ON_ONCE(refcount_read(&mk->mk_active_refs) != 0);
-	key_put(mk->mk_users);
-	mk->mk_users = NULL;
+	WARN_ON(refcount_read(&mk->mk_active_refs) != 0);
+	clear_mk_users(mk);
 	call_rcu(&mk->mk_rcu_head, fscrypt_free_master_key);
 }
 
-void fscrypt_put_master_key_activeref(struct super_block *sb,
-				      struct fscrypt_master_key *mk)
+void fscrypt_put_master_key_activeref(struct fscrypt_master_key *mk)
 {
+	struct super_block *sb = mk->mk_sb;
+	struct fscrypt_keyring *keyring = sb->s_master_keys;
 	size_t i;
 
 	if (!refcount_dec_and_test(&mk->mk_active_refs))
@@ -92,18 +94,16 @@ void fscrypt_put_master_key_activeref(struct super_block *sb,
 	 * destroying any subkeys embedded in it.
 	 */
 
-	if (WARN_ON_ONCE(!sb->s_master_keys))
-		return;
-	spin_lock(&sb->s_master_keys->lock);
+	spin_lock(&keyring->lock);
 	hlist_del_rcu(&mk->mk_node);
-	spin_unlock(&sb->s_master_keys->lock);
+	spin_unlock(&keyring->lock);
 
 	/*
 	 * ->mk_active_refs == 0 implies that ->mk_secret is not present and
 	 * that ->mk_decrypted_inodes is empty.
 	 */
-	WARN_ON_ONCE(is_master_key_secret_present(&mk->mk_secret));
-	WARN_ON_ONCE(!list_empty(&mk->mk_decrypted_inodes));
+	WARN_ON(is_master_key_secret_present(&mk->mk_secret));
+	WARN_ON(!list_empty(&mk->mk_decrypted_inodes));
 
 	for (i = 0; i <= FSCRYPT_MODE_MAX; i++) {
 		fscrypt_destroy_prepared_key(
@@ -132,11 +132,11 @@ static int fscrypt_user_key_instantiate(struct key *key,
 					struct key_preparsed_payload *prep)
 {
 	/*
-	 * We just charge FSCRYPT_MAX_STANDARD_KEY_SIZE bytes to the user's key
-	 * quota for each key, regardless of the exact key size.  The amount of
-	 * memory actually used is greater than the size of the raw key anyway.
+	 * We just charge FSCRYPT_MAX_KEY_SIZE bytes to the user's key quota for
+	 * each key, regardless of the exact key size.  The amount of memory
+	 * actually used is greater than the size of the raw key anyway.
 	 */
-	return key_payload_reserve(key, FSCRYPT_MAX_STANDARD_KEY_SIZE);
+	return key_payload_reserve(key, FSCRYPT_MAX_KEY_SIZE);
 }
 
 static void fscrypt_user_key_describe(const struct key *key, struct seq_file *m)
@@ -145,8 +145,8 @@ static void fscrypt_user_key_describe(const struct key *key, struct seq_file *m)
 }
 
 /*
- * Type of key in ->mk_users.  Each key of this type represents a particular
- * user who has added a particular master key.
+ * Type of fscrypt_master_key_user::quota_key.  This contains no secret; it
+ * exists solely to charge a user's key quota.
  *
  * Note that the name of this key type really should be something like
  * ".fscrypt-user" instead of simply ".fscrypt".  But the shorter name is chosen
@@ -160,29 +160,8 @@ static struct key_type key_type_fscrypt_user = {
 	.describe		= fscrypt_user_key_describe,
 };
 
-#define FSCRYPT_MK_USERS_DESCRIPTION_SIZE	\
-	(CONST_STRLEN("fscrypt-") + 2 * FSCRYPT_KEY_IDENTIFIER_SIZE + \
-	 CONST_STRLEN("-users") + 1)
-
 #define FSCRYPT_MK_USER_DESCRIPTION_SIZE	\
 	(2 * FSCRYPT_KEY_IDENTIFIER_SIZE + CONST_STRLEN(".uid.") + 10 + 1)
-
-static void format_mk_users_keyring_description(
-			char description[FSCRYPT_MK_USERS_DESCRIPTION_SIZE],
-			const u8 mk_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE])
-{
-	sprintf(description, "fscrypt-%*phN-users",
-		FSCRYPT_KEY_IDENTIFIER_SIZE, mk_identifier);
-}
-
-static void format_mk_user_description(
-			char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE],
-			const u8 mk_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE])
-{
-
-	sprintf(description, "%*phN.uid.%u", FSCRYPT_KEY_IDENTIFIER_SIZE,
-		mk_identifier, __kuid_val(current_fsuid()));
-}
 
 /* Create ->s_master_keys if needed.  Synchronized by fscrypt_add_key_mutex. */
 static int allocate_filesystem_keyring(struct super_block *sb)
@@ -209,11 +188,14 @@ static int allocate_filesystem_keyring(struct super_block *sb)
  * Release all encryption keys that have been added to the filesystem, along
  * with the keyring that contains them.
  *
- * This is called at unmount time, after all potentially-encrypted inodes have
- * been evicted.  The filesystem's underlying block device(s) are still
- * available at this time; this is important because after user file accesses
- * have been allowed, this function may need to evict keys from the keyslots of
- * an inline crypto engine, which requires the block device(s).
+ * This is called at unmount time.  The filesystem's underlying block device(s)
+ * are still available at this time; this is important because after user file
+ * accesses have been allowed, this function may need to evict keys from the
+ * keyslots of an inline crypto engine, which requires the block device(s).
+ *
+ * This is also called when the super_block is being freed.  This is needed to
+ * avoid a memory leak if mounting fails after the "test_dummy_encryption"
+ * option was processed, as in that case the unmount-time call isn't made.
  */
 void fscrypt_destroy_keyring(struct super_block *sb)
 {
@@ -230,18 +212,18 @@ void fscrypt_destroy_keyring(struct super_block *sb)
 
 		hlist_for_each_entry_safe(mk, tmp, bucket, mk_node) {
 			/*
-			 * Since all potentially-encrypted inodes were already
-			 * evicted, every key remaining in the keyring should
-			 * have an empty inode list, and should only still be in
-			 * the keyring due to the single active ref associated
-			 * with ->mk_secret.  There should be no structural refs
-			 * beyond the one associated with the active ref.
+			 * Since all inodes were already evicted, every key
+			 * remaining in the keyring should have an empty inode
+			 * list, and should only still be in the keyring due to
+			 * the single active ref associated with ->mk_secret.
+			 * There should be no structural refs beyond the one
+			 * associated with the active ref.
 			 */
-			WARN_ON_ONCE(refcount_read(&mk->mk_active_refs) != 1);
-			WARN_ON_ONCE(refcount_read(&mk->mk_struct_refs) != 1);
-			WARN_ON_ONCE(!is_master_key_secret_present(&mk->mk_secret));
+			WARN_ON(refcount_read(&mk->mk_active_refs) != 1);
+			WARN_ON(refcount_read(&mk->mk_struct_refs) != 1);
+			WARN_ON(!is_master_key_secret_present(&mk->mk_secret));
 			wipe_master_key_secret(&mk->mk_secret);
-			fscrypt_put_master_key_activeref(sb, mk);
+			fscrypt_put_master_key_activeref(mk);
 		}
 	}
 	kfree_sensitive(keyring);
@@ -319,91 +301,94 @@ out:
 	return mk;
 }
 
-static int allocate_master_key_users_keyring(struct fscrypt_master_key *mk)
+/* Find the current user's claim in ->mk_users.  ->mk_sem must be held. */
+static struct fscrypt_master_key_user *
+find_master_key_user(struct fscrypt_master_key *mk)
 {
-	char description[FSCRYPT_MK_USERS_DESCRIPTION_SIZE];
-	struct key *keyring;
+	struct fscrypt_master_key_user *mk_user;
+	kuid_t uid = current_fsuid();
 
-	format_mk_users_keyring_description(description,
-					    mk->mk_spec.u.identifier);
-	keyring = keyring_alloc(description, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
-				current_cred(), KEY_POS_SEARCH |
-				  KEY_USR_SEARCH | KEY_USR_READ | KEY_USR_VIEW,
-				KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
-	if (IS_ERR(keyring))
-		return PTR_ERR(keyring);
-
-	mk->mk_users = keyring;
-	return 0;
-}
-
-/*
- * Find the current user's "key" in the master key's ->mk_users.
- * Returns ERR_PTR(-ENOKEY) if not found.
- */
-static struct key *find_master_key_user(struct fscrypt_master_key *mk)
-{
-	char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE];
-	key_ref_t keyref;
-
-	format_mk_user_description(description, mk->mk_spec.u.identifier);
-
-	/*
-	 * We need to mark the keyring reference as "possessed" so that we
-	 * acquire permission to search it, via the KEY_POS_SEARCH permission.
-	 */
-	keyref = keyring_search(make_key_ref(mk->mk_users, true /*possessed*/),
-				&key_type_fscrypt_user, description, false);
-	if (IS_ERR(keyref)) {
-		if (PTR_ERR(keyref) == -EAGAIN || /* not found */
-		    PTR_ERR(keyref) == -EKEYREVOKED) /* recently invalidated */
-			keyref = ERR_PTR(-ENOKEY);
-		return ERR_CAST(keyref);
+	list_for_each_entry(mk_user, &mk->mk_users, link) {
+		if (uid_eq(mk_user->uid, uid))
+			return mk_user;
 	}
-	return key_ref_to_ptr(keyref);
+	return NULL;
 }
 
 /*
- * Give the current user a "key" in ->mk_users.  This charges the user's quota
+ * Give the current user a claim in ->mk_users.  This charges the user's quota
  * and marks the master key as added by the current user, so that it cannot be
  * removed by another user with the key.  Either ->mk_sem must be held for
  * write, or the master key must be still undergoing initialization.
  */
 static int add_master_key_user(struct fscrypt_master_key *mk)
 {
+	kuid_t uid = current_fsuid();
 	char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE];
-	struct key *mk_user;
+	struct key *quota_key;
+	struct fscrypt_master_key_user *mk_user;
 	int err;
 
-	format_mk_user_description(description, mk->mk_spec.u.identifier);
-	mk_user = key_alloc(&key_type_fscrypt_user, description,
-			    current_fsuid(), current_gid(), current_cred(),
-			    KEY_POS_SEARCH | KEY_USR_VIEW, 0, NULL);
-	if (IS_ERR(mk_user))
-		return PTR_ERR(mk_user);
+	snprintf(description, sizeof(description), "%*phN.uid.%u",
+		 FSCRYPT_KEY_IDENTIFIER_SIZE, mk->mk_spec.u.identifier,
+		 __kuid_val(uid));
+	quota_key = key_alloc(&key_type_fscrypt_user, description, uid,
+			      current_gid(), current_cred(),
+			      KEY_POS_SEARCH | KEY_USR_VIEW, 0, NULL);
+	if (IS_ERR(quota_key))
+		return PTR_ERR(quota_key);
 
-	err = key_instantiate_and_link(mk_user, NULL, 0, mk->mk_users, NULL);
-	key_put(mk_user);
-	return err;
+	err = key_instantiate_and_link(quota_key, NULL, 0, NULL, NULL);
+	if (err) {
+		key_put(quota_key);
+		return err;
+	}
+
+	mk_user = kzalloc(sizeof(*mk_user), GFP_KERNEL);
+	if (!mk_user) {
+		key_put(quota_key);
+		return -ENOMEM;
+	}
+	mk_user->uid = uid;
+	mk_user->quota_key = quota_key;
+	list_add(&mk_user->link, &mk->mk_users);
+	return 0;
+}
+
+static void unlink_and_free_mk_user(struct fscrypt_master_key_user *mk_user)
+{
+	list_del(&mk_user->link);
+	key_put(mk_user->quota_key);
+	kfree(mk_user);
 }
 
 /*
- * Remove the current user's "key" from ->mk_users.
+ * Remove the current user's claim from ->mk_users.
  * ->mk_sem must be held for write.
  *
- * Returns 0 if removed, -ENOKEY if not found, or another -errno code.
+ * Returns 0 if removed or -ENOKEY if not found.
  */
 static int remove_master_key_user(struct fscrypt_master_key *mk)
 {
-	struct key *mk_user;
-	int err;
+	struct fscrypt_master_key_user *mk_user;
 
 	mk_user = find_master_key_user(mk);
-	if (IS_ERR(mk_user))
-		return PTR_ERR(mk_user);
-	err = key_unlink(mk->mk_users, mk_user);
-	key_put(mk_user);
-	return err;
+	if (!mk_user)
+		return -ENOKEY;
+	unlink_and_free_mk_user(mk_user);
+	return 0;
+}
+
+/*
+ * Clear ->mk_users.  Either ->mk_sem must be held for write, or 'mk' must have
+ * no structural references left.
+ */
+static void clear_mk_users(struct fscrypt_master_key *mk)
+{
+	struct fscrypt_master_key_user *mk_user, *tmp;
+
+	list_for_each_entry_safe(mk_user, tmp, &mk->mk_users, link)
+		unlink_and_free_mk_user(mk_user);
 }
 
 /*
@@ -422,17 +407,17 @@ static int add_new_master_key(struct super_block *sb,
 	if (!mk)
 		return -ENOMEM;
 
+	mk->mk_sb = sb;
 	init_rwsem(&mk->mk_sem);
 	refcount_set(&mk->mk_struct_refs, 1);
 	mk->mk_spec = *mk_spec;
+
+	INIT_LIST_HEAD(&mk->mk_users);
 
 	INIT_LIST_HEAD(&mk->mk_decrypted_inodes);
 	spin_lock_init(&mk->mk_decrypted_inodes_lock);
 
 	if (mk_spec->type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
-		err = allocate_master_key_users_keyring(mk);
-		if (err)
-			goto out_put;
 		err = add_master_key_user(mk);
 		if (err)
 			goto out_put;
@@ -460,19 +445,13 @@ static int add_existing_master_key(struct fscrypt_master_key *mk,
 	int err;
 
 	/*
-	 * If the current user is already in ->mk_users, then there's nothing to
-	 * do.  Otherwise, we need to add the user to ->mk_users.  (Neither is
-	 * applicable for v1 policy keys, which have NULL ->mk_users.)
+	 * For v2 policy keys (FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER): If the current
+	 * user is already in ->mk_users, then there's nothing to do.
+	 * Otherwise, add the user to ->mk_users.
 	 */
-	if (mk->mk_users) {
-		struct key *mk_user = find_master_key_user(mk);
-
-		if (mk_user != ERR_PTR(-ENOKEY)) {
-			if (IS_ERR(mk_user))
-				return PTR_ERR(mk_user);
-			key_put(mk_user);
+	if (mk->mk_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
+		if (find_master_key_user(mk) != NULL)
 			return 0;
-		}
 		err = add_master_key_user(mk);
 		if (err)
 			return err;
@@ -534,36 +513,20 @@ static int add_master_key(struct super_block *sb,
 	int err;
 
 	if (key_spec->type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
-		u8 sw_secret[BLK_CRYPTO_SW_SECRET_SIZE];
-		u8 *kdf_key = secret->raw;
-		unsigned int kdf_key_size = secret->size;
-		u8 keyid_kdf_ctx = HKDF_CONTEXT_KEY_IDENTIFIER;
-
-		/*
-		 * For standard keys, the fscrypt master key is used directly as
-		 * the fscrypt KDF key.  For hardware-wrapped keys, we have to
-		 * pass the master key to the hardware to derive the KDF key,
-		 * which is then only used to derive non-file-contents subkeys.
-		 */
-		if (secret->is_hw_wrapped) {
-			err = fscrypt_derive_sw_secret(sb, secret->raw,
-						       secret->size, sw_secret);
-			if (err)
-				return err;
-			kdf_key = sw_secret;
-			kdf_key_size = sizeof(sw_secret);
-		}
-		err = fscrypt_init_hkdf(&secret->hkdf, kdf_key, kdf_key_size);
-		/*
-		 * Now that the KDF context is initialized, the raw KDF key is
-		 * no longer needed.
-		 */
-		memzero_explicit(kdf_key, kdf_key_size);
+		err = fscrypt_init_hkdf(&secret->hkdf, secret->raw,
+					secret->size);
 		if (err)
 			return err;
 
+		/*
+		 * Now that the HKDF context is initialized, the raw key is no
+		 * longer needed.
+		 */
+		memzero_explicit(secret->raw, secret->size);
+
 		/* Calculate the key identifier */
-		err = fscrypt_hkdf_expand(&secret->hkdf, keyid_kdf_ctx, NULL, 0,
+		err = fscrypt_hkdf_expand(&secret->hkdf,
+					  HKDF_CONTEXT_KEY_IDENTIFIER, NULL, 0,
 					  key_spec->u.identifier,
 					  FSCRYPT_KEY_IDENTIFIER_SIZE);
 		if (err)
@@ -577,7 +540,7 @@ static int fscrypt_provisioning_key_preparse(struct key_preparsed_payload *prep)
 	const struct fscrypt_provisioning_key_payload *payload = prep->data;
 
 	if (prep->datalen < sizeof(*payload) + FSCRYPT_MIN_KEY_SIZE ||
-	    prep->datalen > sizeof(*payload) + FSCRYPT_MAX_ANY_KEY_SIZE)
+	    prep->datalen > sizeof(*payload) + FSCRYPT_MAX_KEY_SIZE)
 		return -EINVAL;
 
 	if (payload->type != FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR &&
@@ -726,30 +689,15 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
 		return -EACCES;
 
 	memset(&secret, 0, sizeof(secret));
-
-	if (arg.__flags) {
-		if (arg.__flags & ~__FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED)
-			return -EINVAL;
-		if (arg.key_spec.type != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER)
-			return -EINVAL;
-		secret.is_hw_wrapped = true;
-	}
-
 	if (arg.key_id) {
 		if (arg.raw_size != 0)
 			return -EINVAL;
 		err = get_keyring_key(arg.key_id, arg.key_spec.type, &secret);
 		if (err)
 			goto out_wipe_secret;
-		err = -EINVAL;
-		if (secret.size > FSCRYPT_MAX_STANDARD_KEY_SIZE &&
-		    !secret.is_hw_wrapped)
-			goto out_wipe_secret;
 	} else {
 		if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
-		    arg.raw_size > (secret.is_hw_wrapped ?
-				    FSCRYPT_MAX_HW_WRAPPED_KEY_SIZE :
-				    FSCRYPT_MAX_STANDARD_KEY_SIZE))
+		    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
 			return -EINVAL;
 		secret.size = arg.raw_size;
 		err = -EFAULT;
@@ -777,13 +725,13 @@ EXPORT_SYMBOL_GPL(fscrypt_ioctl_add_key);
 static void
 fscrypt_get_test_dummy_secret(struct fscrypt_master_key_secret *secret)
 {
-	static u8 test_key[FSCRYPT_MAX_STANDARD_KEY_SIZE];
+	static u8 test_key[FSCRYPT_MAX_KEY_SIZE];
 
-	get_random_once(test_key, sizeof(test_key));
+	get_random_once(test_key, FSCRYPT_MAX_KEY_SIZE);
 
 	memset(secret, 0, sizeof(*secret));
-	secret->size = sizeof(test_key);
-	memcpy(secret->raw, test_key, sizeof(test_key));
+	secret->size = FSCRYPT_MAX_KEY_SIZE;
+	memcpy(secret->raw, test_key, FSCRYPT_MAX_KEY_SIZE);
 }
 
 int fscrypt_get_test_dummy_key_identifier(
@@ -808,26 +756,34 @@ out:
 /**
  * fscrypt_add_test_dummy_key() - add the test dummy encryption key
  * @sb: the filesystem instance to add the key to
- * @key_spec: the key specifier of the test dummy encryption key
+ * @dummy_policy: the encryption policy for test_dummy_encryption
  *
- * Add the key for the test_dummy_encryption mount option to the filesystem.  To
- * prevent misuse of this mount option, a per-boot random key is used instead of
- * a hardcoded one.  This makes it so that any encrypted files created using
- * this option won't be accessible after a reboot.
+ * If needed, add the key for the test_dummy_encryption mount option to the
+ * filesystem.  To prevent misuse of this mount option, a per-boot random key is
+ * used instead of a hardcoded one.  This makes it so that any encrypted files
+ * created using this option won't be accessible after a reboot.
  *
  * Return: 0 on success, -errno on failure
  */
 int fscrypt_add_test_dummy_key(struct super_block *sb,
-			       struct fscrypt_key_specifier *key_spec)
+			       const struct fscrypt_dummy_policy *dummy_policy)
 {
+	const union fscrypt_policy *policy = dummy_policy->policy;
+	struct fscrypt_key_specifier key_spec;
 	struct fscrypt_master_key_secret secret;
 	int err;
 
+	if (!policy)
+		return 0;
+	err = fscrypt_policy_to_key_spec(policy, &key_spec);
+	if (err)
+		return err;
 	fscrypt_get_test_dummy_secret(&secret);
-	err = add_master_key(sb, &secret, key_spec);
+	err = add_master_key(sb, &secret, &key_spec);
 	wipe_master_key_secret(&secret);
 	return err;
 }
+EXPORT_SYMBOL_GPL(fscrypt_add_test_dummy_key);
 
 /*
  * Verify that the current user has added a master key with the given identifier
@@ -850,7 +806,6 @@ int fscrypt_verify_key_added(struct super_block *sb,
 {
 	struct fscrypt_key_specifier mk_spec;
 	struct fscrypt_master_key *mk;
-	struct key *mk_user;
 	int err;
 
 	mk_spec.type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
@@ -862,13 +817,10 @@ int fscrypt_verify_key_added(struct super_block *sb,
 		goto out;
 	}
 	down_read(&mk->mk_sem);
-	mk_user = find_master_key_user(mk);
-	if (IS_ERR(mk_user)) {
-		err = PTR_ERR(mk_user);
-	} else {
-		key_put(mk_user);
+	if (find_master_key_user(mk) != NULL)
 		err = 0;
-	}
+	else
+		err = -ENOKEY;
 	up_read(&mk->mk_sem);
 	fscrypt_put_master_key(mk);
 out:
@@ -1061,16 +1013,18 @@ static int do_remove_key(struct file *filp, void __user *_uarg, bool all_users)
 	down_write(&mk->mk_sem);
 
 	/* If relevant, remove current user's (or all users) claim to the key */
-	if (mk->mk_users && mk->mk_users->keys.nr_leaves_on_tree != 0) {
-		if (all_users)
-			err = keyring_clear(mk->mk_users);
-		else
+	if (!list_empty(&mk->mk_users)) {
+		if (all_users) {
+			clear_mk_users(mk);
+			err = 0;
+		} else {
 			err = remove_master_key_user(mk);
+		}
 		if (err) {
 			up_write(&mk->mk_sem);
 			goto out_put_key;
 		}
-		if (mk->mk_users->keys.nr_leaves_on_tree != 0) {
+		if (!list_empty(&mk->mk_users)) {
 			/*
 			 * Other users have still added the key too.  We removed
 			 * the current user's claim to the key, but we still
@@ -1088,7 +1042,7 @@ static int do_remove_key(struct file *filp, void __user *_uarg, bool all_users)
 	err = -ENOKEY;
 	if (is_master_key_secret_present(&mk->mk_secret)) {
 		wipe_master_key_secret(&mk->mk_secret);
-		fscrypt_put_master_key_activeref(sb, mk);
+		fscrypt_put_master_key_activeref(mk);
 		err = 0;
 	}
 	inodes_remain = refcount_read(&mk->mk_active_refs) > 0;
@@ -1158,6 +1112,8 @@ int fscrypt_ioctl_get_key_status(struct file *filp, void __user *uarg)
 	struct super_block *sb = file_inode(filp)->i_sb;
 	struct fscrypt_get_key_status_arg arg;
 	struct fscrypt_master_key *mk;
+	kuid_t uid;
+	const struct fscrypt_master_key_user *mk_user;
 	int err;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
@@ -1190,19 +1146,13 @@ int fscrypt_ioctl_get_key_status(struct file *filp, void __user *uarg)
 	}
 
 	arg.status = FSCRYPT_KEY_STATUS_PRESENT;
-	if (mk->mk_users) {
-		struct key *mk_user;
 
-		arg.user_count = mk->mk_users->keys.nr_leaves_on_tree;
-		mk_user = find_master_key_user(mk);
-		if (!IS_ERR(mk_user)) {
+	uid = current_fsuid();
+	list_for_each_entry(mk_user, &mk->mk_users, link) {
+		arg.user_count++;
+		if (uid_eq(mk_user->uid, uid))
 			arg.status_flags |=
 				FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF;
-			key_put(mk_user);
-		} else if (mk_user != ERR_PTR(-ENOKEY)) {
-			err = PTR_ERR(mk_user);
-			goto out_release_key;
-		}
 	}
 	err = 0;
 out_release_key:
@@ -1233,42 +1183,3 @@ err_unregister_fscrypt_user:
 	unregister_key_type(&key_type_fscrypt_user);
 	return err;
 }
-
-#ifdef CONFIG_HYPERHOLD_CORE
-#define FSCRYPT_MAX_KEY_SIZE 64
-int hyperhold_get_keyring_key(u32 key_id, u8 *key_buffer,
-	u8 key_buffer_len, u32 *key_len)
-{
-	int ret = 0;
-	struct fscrypt_master_key_secret secret;
-
-	if (key_buffer_len < FSCRYPT_MAX_HW_WRAPPED_KEY_SIZE) {
-		pr_err("hyperhold_get_keyring_key len err\n");
-
-		return -EFAULT;
-	}
-
-	memset(&secret, 0, sizeof(struct fscrypt_master_key_secret));
-	secret.is_hw_wrapped = true;
-
-	ret = get_keyring_key(key_id, FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER, &secret);
-	if (ret) {
-		pr_err("hyperhold_get_keyring_key fail %d\n", ret);
-		goto out_wipe_secret;
-	}
-
-	if (secret.size > FSCRYPT_MAX_KEY_SIZE && !secret.is_hw_wrapped) {
-		ret = -EFAULT;
-		pr_err("hyperhold_get_keyring_key size err %u\n", secret.size);
-		goto out_wipe_secret;
-	}
-
-	memcpy(key_buffer, secret.raw, secret.size);
-	*key_len = secret.size;
-
-out_wipe_secret:
-	wipe_master_key_secret(&secret);
-
-	return ret;
-}
-#endif

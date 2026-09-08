@@ -384,33 +384,6 @@ static int __walk_page_range(unsigned long start, unsigned long end,
 	return err;
 }
 
-static inline void process_mm_walk_lock(struct mm_struct *mm,
-					enum page_walk_lock walk_lock)
-{
-	if (walk_lock == PGWALK_RDLOCK)
-		mmap_assert_locked(mm);
-	else
-		mmap_assert_write_locked(mm);
-}
-
-static inline void process_vma_walk_lock(struct vm_area_struct *vma,
-					 enum page_walk_lock walk_lock)
-{
-#ifdef CONFIG_PER_VMA_LOCK
-	switch (walk_lock) {
-	case PGWALK_WRLOCK:
-		vma_start_write(vma);
-		break;
-	case PGWALK_WRLOCK_VERIFY:
-		vma_assert_write_locked(vma);
-		break;
-	case PGWALK_RDLOCK:
-		/* PGWALK_RDLOCK is handled by process_mm_walk_lock */
-		break;
-	}
-#endif
-}
-
 /**
  * walk_page_range - walk page table with caller specific callbacks
  * @mm:		mm_struct representing the target process of page table walk
@@ -470,7 +443,7 @@ int walk_page_range(struct mm_struct *mm, unsigned long start,
 	if (!walk.mm)
 		return -EINVAL;
 
-	process_mm_walk_lock(walk.mm, ops->walk_lock);
+	mmap_assert_locked(walk.mm);
 
 	vma = find_vma(walk.mm, start);
 	do {
@@ -485,7 +458,6 @@ int walk_page_range(struct mm_struct *mm, unsigned long start,
 			if (ops->pte_hole)
 				err = ops->pte_hole(start, next, -1, &walk);
 		} else { /* inside vma */
-			process_vma_walk_lock(vma, ops->walk_lock);
 			walk.vma = vma;
 			next = min(end, vma->vm_end);
 			vma = find_vma(mm, vma->vm_end);
@@ -509,7 +481,6 @@ int walk_page_range(struct mm_struct *mm, unsigned long start,
 	} while (start = next, start < end);
 	return err;
 }
-EXPORT_SYMBOL_GPL(walk_page_range);
 
 /**
  * walk_page_range_novma - walk a range of pagetables not backed by a vma
@@ -524,6 +495,8 @@ EXPORT_SYMBOL_GPL(walk_page_range);
  * not backed by VMAs. Because 'unusual' entries may be walked this function
  * will also not lock the PTEs for the pte_entry() callback. This is useful for
  * walking the kernel pages tables or page tables for firmware.
+ *
+ * The mmap write lock must be held.
  */
 int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
 			  unsigned long end, const struct mm_walk_ops *ops,
@@ -541,11 +514,38 @@ int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
 	if (start >= end || !walk.mm)
 		return -EINVAL;
 
+	/*
+	 * When walking userland page tables, an mmap write lock must be held to
+	 * account for munmap() downgrading to an mmap read lock when tearing
+	 * down page tables.
+	 *
+	 * When walking kernel page tables, an mmap write lock must also be held
+	 * to account for page table freeing on vmap huge page mapping.
+	 */
 	mmap_assert_write_locked(walk.mm);
 
 	return walk_pgd_range(start, end, &walk);
 }
-EXPORT_SYMBOL_GPL(walk_page_range_novma);
+
+int walk_page_range_vma(struct vm_area_struct *vma, unsigned long start,
+			unsigned long end, const struct mm_walk_ops *ops,
+			void *private)
+{
+	struct mm_walk walk = {
+		.ops		= ops,
+		.mm		= vma->vm_mm,
+		.vma		= vma,
+		.private	= private,
+	};
+
+	if (start >= end || !walk.mm)
+		return -EINVAL;
+	if (start < vma->vm_start || end > vma->vm_end)
+		return -EINVAL;
+
+	mmap_assert_locked(walk.mm);
+	return __walk_page_range(start, end, &walk);
+}
 
 int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 		void *private)
@@ -561,8 +561,7 @@ int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 	if (!walk.mm)
 		return -EINVAL;
 
-	process_mm_walk_lock(walk.mm, ops->walk_lock);
-	process_vma_walk_lock(vma, ops->walk_lock);
+	mmap_assert_locked(walk.mm);
 
 	err = walk_page_test(vma->vm_start, vma->vm_end, &walk);
 	if (err > 0)
@@ -571,9 +570,6 @@ int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 		return err;
 	return __walk_page_range(vma->vm_start, vma->vm_end, &walk);
 }
-#if IS_ENABLED(CONFIG_FMPS)
-EXPORT_SYMBOL_GPL(walk_page_vma);
-#endif
 
 /**
  * walk_page_mapping - walk all memory areas mapped into a struct address_space.
@@ -651,4 +647,3 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
 
 	return err;
 }
-EXPORT_SYMBOL_GPL(walk_page_mapping);

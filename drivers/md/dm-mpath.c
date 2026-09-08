@@ -135,6 +135,7 @@ static bool mpath_double_check_test_bit(int MPATHF_bit, struct multipath *m)
 
 	if (r) {
 		unsigned long flags;
+
 		spin_lock_irqsave(&m->lock, flags);
 		r = test_bit(MPATHF_bit, &m->flags);
 		spin_unlock_irqrestore(&m->lock, flags);
@@ -214,6 +215,7 @@ static struct multipath *alloc_multipath(struct dm_target *ti)
 		mutex_init(&m->work_mutex);
 
 		m->queue_mode = DM_TYPE_NONE;
+		m->pg_init_delay_msecs = DM_PG_INIT_DELAY_DEFAULT;
 
 		m->ti = ti;
 		ti->private = m;
@@ -246,7 +248,6 @@ static int alloc_multipath_stage2(struct dm_target *ti, struct multipath *m)
 	set_bit(MPATHF_QUEUE_IO, &m->flags);
 	atomic_set(&m->pg_init_in_progress, 0);
 	atomic_set(&m->pg_init_count, 0);
-	m->pg_init_delay_msecs = DM_PG_INIT_DELAY_DEFAULT;
 	init_waitqueue_head(&m->pg_init_wait);
 
 	return 0;
@@ -707,6 +708,7 @@ static void process_queued_bios(struct work_struct *work)
 	blk_start_plug(&plug);
 	while ((bio = bio_list_pop(&bios))) {
 		struct dm_mpath_io *mpio = get_mpio_from_bio(bio);
+
 		dm_bio_restore(get_bio_details_from_mpio(mpio), bio);
 		r = __multipath_map_bio(m, bio, mpio);
 		switch (r) {
@@ -2116,6 +2118,7 @@ static int multipath_busy(struct dm_target *ti)
 	/* no paths available, for blk-mq: rely on IO mapping to delay requeue */
 	if (!atomic_read(&m->nr_valid_paths)) {
 		unsigned long flags;
+
 		spin_lock_irqsave(&m->lock, flags);
 		if (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
 			spin_unlock_irqrestore(&m->lock, flags);

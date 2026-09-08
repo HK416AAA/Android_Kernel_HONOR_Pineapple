@@ -233,7 +233,12 @@ static inline bool userfaultfd_huge_must_wait(struct userfaultfd_ctx *ctx,
 	 */
 	if (huge_pte_none_mostly(pte))
 		ret = true;
-	if (!huge_pte_write(pte) && (reason & VM_UFFD_WP))
+	/*
+	 * Gate the writability check on pte_present(): huge_pte_write() on a
+	 * non-present migration entry decodes random offset bits. The
+	 * migration completion path re-delivers the fault if still needed.
+	 */
+	if (pte_present(pte) && !huge_pte_write(pte) && (reason & VM_UFFD_WP))
 		ret = true;
 out:
 	return ret;
@@ -313,7 +318,12 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,
 	 */
 	if (pte_none_mostly(*pte))
 		ret = true;
-	if (!pte_write(*pte) && (reason & VM_UFFD_WP))
+	/*
+	 * Gate the writability check on pte_present(): pte_write() on a
+	 * non-present swap/migration entry decodes random offset bits. The
+	 * page-in path re-delivers the fault if it still needs userspace.
+	 */
+	if (pte_present(*pte) && !pte_write(*pte) && (reason & VM_UFFD_WP))
 		ret = true;
 	pte_unmap(pte);
 
@@ -1234,8 +1244,6 @@ static __always_inline int validate_range(struct mm_struct *mm,
 		return -EINVAL;
 	if (!len)
 		return -EINVAL;
-	if (start < mmap_min_addr)
-		return -EINVAL;
 	if (start >= task_size)
 		return -EINVAL;
 	if (len > task_size - start)
@@ -1388,6 +1396,9 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 	prev = mas_prev(&mas, 0);
 	if (prev != vma)
 		mas_next(&mas, ULONG_MAX);
+
+	if (vma->vm_start < start)
+		prev = vma;
 
 	ret = 0;
 	do {
@@ -1566,6 +1577,9 @@ static int userfaultfd_unregister(struct userfaultfd_ctx *ctx,
 	prev = mas_prev(&mas, 0);
 	if (prev != vma)
 		mas_next(&mas, ULONG_MAX);
+
+	if (vma->vm_start < start)
+		prev = vma;
 
 	ret = 0;
 	do {

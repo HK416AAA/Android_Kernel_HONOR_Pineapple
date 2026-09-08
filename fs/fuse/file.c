@@ -8,7 +8,6 @@
 
 #include "fuse_i.h"
 
-#include <linux/filter.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
@@ -55,7 +54,7 @@ struct fuse_release_args {
 	struct inode *inode;
 };
 
-struct fuse_file *fuse_file_alloc(struct fuse_mount *fm)
+struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
 {
 	struct fuse_file *ff;
 
@@ -64,11 +63,13 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm)
 		return NULL;
 
 	ff->fm = fm;
-	ff->release_args = kzalloc(sizeof(*ff->release_args),
-				   GFP_KERNEL_ACCOUNT);
-	if (!ff->release_args) {
-		kfree(ff);
-		return NULL;
+	if (release) {
+		ff->release_args = kzalloc(sizeof(*ff->release_args),
+					   GFP_KERNEL_ACCOUNT);
+		if (!ff->release_args) {
+			kfree(ff);
+			return NULL;
+		}
 	}
 
 	INIT_LIST_HEAD(&ff->write_entry);
@@ -104,39 +105,27 @@ static void fuse_release_end(struct fuse_mount *fm, struct fuse_args *args,
 	kfree(ra);
 }
 
-static void fuse_file_put(struct inode *inode, struct fuse_file *ff,
-			  bool sync, bool isdir)
+static void fuse_file_put(struct fuse_file *ff, bool sync)
 {
-	struct fuse_args *args = &ff->release_args->args;
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-#endif
+	if (refcount_dec_and_test(&ff->count)) {
+		struct fuse_release_args *ra = ff->release_args;
+		struct fuse_args *args = (ra ? &ra->args : NULL);
 
-	if (!refcount_dec_and_test(&ff->count))
-		return;
-
-#ifdef CONFIG_FUSE_BPF
-	fer = fuse_bpf_backing(inode, struct fuse_release_in,
-		       fuse_release_initialize, fuse_release_backing,
-		       fuse_release_finalize,
-		       inode, ff);
-	if (fer.ret) {
-		fuse_release_end(ff->fm, args, 0);
-	} else
-#endif
-	if (isdir ? ff->fm->fc->no_opendir : ff->fm->fc->no_open) {
-		/* Do nothing when client does not implement 'open' */
-		fuse_release_end(ff->fm, args, 0);
-	} else if (sync) {
-		fuse_simple_request(ff->fm, args);
-		fuse_release_end(ff->fm, args, 0);
-	} else {
-		args->end = fuse_release_end;
-		if (fuse_simple_background(ff->fm, args,
-				GFP_KERNEL | __GFP_NOFAIL))
-			fuse_release_end(ff->fm, args, -ENOTCONN);
+		if (!args) {
+			/* Do nothing when server does not implement 'opendir' */
+		} else if (args->opcode == FUSE_RELEASE && ff->fm->fc->no_open) {
+			fuse_release_end(ff->fm, args, 0);
+		} else if (sync) {
+			fuse_simple_request(ff->fm, args);
+			fuse_release_end(ff->fm, args, 0);
+		} else {
+			args->end = fuse_release_end;
+			if (fuse_simple_background(ff->fm, args,
+						   GFP_KERNEL | __GFP_NOFAIL))
+				fuse_release_end(ff->fm, args, -ENOTCONN);
+		}
+		kfree(ff);
 	}
-	kfree(ff);
 }
 
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
@@ -145,15 +134,25 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_file *ff;
 	int opcode = isdir ? FUSE_OPENDIR : FUSE_OPEN;
+	bool open = isdir ? !fc->no_opendir : !fc->no_open;
+	bool release = !isdir || open;
 
-	ff = fuse_file_alloc(fm);
+	/*
+	 * ff->args->release_args still needs to be allocated (so we can hold an
+	 * inode reference while there are pending inflight file operations when
+	 * ->release() is called, see fuse_prepare_release()) even if
+	 * fc->no_open is set else it becomes possible for reclaim to deadlock
+	 * if while servicing the readahead request the server triggers reclaim
+	 * and reclaim evicts the inode of the file being read ahead.
+	 */
+	ff = fuse_file_alloc(fm, release);
 	if (!ff)
 		return ERR_PTR(-ENOMEM);
 
 	ff->fh = 0;
 	/* Default for no-open */
 	ff->open_flags = FOPEN_KEEP_CACHE | (isdir ? FOPEN_CACHE_DIR : 0);
-	if (isdir ? !fc->no_opendir : !fc->no_open) {
+	if (open) {
 		struct fuse_open_out outarg;
 		int err;
 
@@ -161,15 +160,18 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 		if (!err) {
 			ff->fh = outarg.fh;
 			ff->open_flags = outarg.open_flags;
-			fuse_passthrough_setup(fc, ff, &outarg);
 		} else if (err != -ENOSYS) {
 			fuse_file_free(ff);
 			return ERR_PTR(err);
 		} else {
-			if (isdir)
+			if (isdir) {
+				/* No release needed */
+				kfree(ff->release_args);
+				ff->release_args = NULL;
 				fc->no_opendir = 1;
-			else
+			} else {
 				fc->no_open = 1;
+			}
 		}
 	}
 
@@ -250,28 +252,14 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 	if (err)
 		return err;
 
-#ifdef CONFIG_FUSE_BPF
-	{
-		struct fuse_err_ret fer;
-
-		fer = fuse_bpf_backing(inode, struct fuse_open_io,
-				       fuse_open_initialize,
-				       fuse_open_backing,
-				       fuse_open_finalize,
-				       inode, file, isdir);
-		if (fer.ret)
-			return PTR_ERR(fer.result);
-	}
-#endif
-
 	if (is_wb_truncate || dax_truncate)
 		inode_lock(inode);
 
 	if (dax_truncate) {
 		filemap_invalidate_lock(inode->i_mapping);
-		err = fuse_dax_break_layouts(inode, 0, 0);
+		err = fuse_dax_break_layouts(inode, 0, -1);
 		if (err)
-			goto out_inode_unlock;
+			goto out_unlock;
 	}
 
 	if (is_wb_truncate || dax_truncate)
@@ -291,9 +279,9 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 			invalidate_inode_pages2(inode->i_mapping);
 	}
+out_unlock:
 	if (dax_truncate)
 		filemap_invalidate_unlock(inode->i_mapping);
-out_inode_unlock:
 	if (is_wb_truncate || dax_truncate)
 		inode_unlock(inode);
 
@@ -301,7 +289,7 @@ out_inode_unlock:
 }
 
 static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
-				 unsigned int flags, int opcode)
+				 unsigned int flags, int opcode, bool sync)
 {
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_release_args *ra = ff->release_args;
@@ -319,6 +307,9 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 
 	wake_up_interruptible_all(&ff->poll_wait);
 
+	if (!ra)
+		return;
+
 	ra->inarg.fh = ff->fh;
 	ra->inarg.flags = flags;
 	ra->args.in_numargs = 1;
@@ -328,6 +319,13 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->args.nodeid = ff->nodeid;
 	ra->args.force = true;
 	ra->args.nocreds = true;
+
+	/*
+	 * Hold inode until release is finished.
+	 * From fuse_sync_release() the refcount is 1 and everything's
+	 * synchronous, so we are fine with not doing igrab() here.
+	 */
+	ra->inode = sync ? NULL : igrab(&fi->inode);
 }
 
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
@@ -337,16 +335,12 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	struct fuse_release_args *ra = ff->release_args;
 	int opcode = isdir ? FUSE_RELEASEDIR : FUSE_RELEASE;
 
-	fuse_passthrough_release(&ff->passthrough);
+	fuse_prepare_release(fi, ff, open_flags, opcode, false);
 
-	fuse_prepare_release(fi, ff, open_flags, opcode);
-
-	if (ff->flock) {
+	if (ra && ff->flock) {
 		ra->inarg.release_flags |= FUSE_RELEASE_FLOCK_UNLOCK;
 		ra->inarg.lock_owner = fuse_lock_owner_id(ff->fm->fc, id);
 	}
-	/* Hold inode until release is finished */
-	ra->inode = igrab(inode);
 
 	/*
 	 * Normally this will send the RELEASE request, however if
@@ -356,8 +350,20 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	 * Make the release synchronous if this is a fuseblk mount,
 	 * synchronous RELEASE is allowed (and desirable) in this case
 	 * because the server can be trusted not to screw up.
+	 *
+	 * Always use the asynchronous file put because the current thread
+	 * might be the fuse server.  This can happen if a process starts some
+	 * aio and closes the fd before the aio completes.  Since aio takes its
+	 * own ref to the file, the IO completion has to drop the ref, which is
+	 * how the fuse server can end up closing its clients' files.
+	 *
+	 * Exception is virtio-fs, which is not affected by the above (server is
+	 * on host, cannot close open files in guest).  Virtio-fs needs sync
+	 * release, because the num_waiting mechanism to wait for all requests
+	 * before commencing with fs shutdown doesn't work if submounts are
+	 * used.
 	 */
-	fuse_file_put(ra->inode, ff, ff->fm->fc->destroy, isdir);
+	fuse_file_put(ff, ff->fm->fc->auto_submounts);
 }
 
 void fuse_release_common(struct file *file, bool isdir)
@@ -392,12 +398,8 @@ void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 		       unsigned int flags)
 {
 	WARN_ON(refcount_read(&ff->count) > 1);
-	fuse_prepare_release(fi, ff, flags, FUSE_RELEASE);
-	/*
-	 * iput(NULL) is a no-op and since the refcount is 1 and everything's
-	 * synchronous, we are fine with not doing igrab() here"
-	 */
-	fuse_file_put(&fi->inode, ff, true, false);
+	fuse_prepare_release(fi, ff, flags, FUSE_RELEASE, true);
+	fuse_file_put(ff, true);
 }
 EXPORT_SYMBOL_GPL(fuse_sync_release);
 
@@ -517,17 +519,6 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	FUSE_ARGS(args);
 	int err;
 
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(file->f_inode, struct fuse_flush_in,
-			       fuse_flush_initialize, fuse_flush_backing,
-			       fuse_flush_finalize,
-			       file, id);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
-
 	if (fuse_is_bad(inode))
 		return -EIO;
 
@@ -602,17 +593,6 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
-
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(inode, struct fuse_fsync_in,
-			       fuse_fsync_initialize, fuse_fsync_backing,
-			       fuse_fsync_finalize,
-			       file, start, end, datasync);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -975,11 +955,8 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 		unlock_page(page);
 		put_page(page);
 	}
-	if (ia->ff) {
-		WARN_ON(!mapping);
-		fuse_file_put(mapping ? mapping->host : NULL, ia->ff,
-			      false, false);
-	}
+	if (ia->ff)
+		fuse_file_put(ia->ff, false);
 
 	fuse_io_free(ia);
 }
@@ -1025,16 +1002,6 @@ static void fuse_readahead(struct readahead_control *rac)
 	struct inode *inode = rac->mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	unsigned int i, max_pages, nr_pages = 0;
-
-#ifdef CONFIG_FUSE_BPF
-	/*
-	 * Currently no meaningful readahead is possible with fuse-bpf within
-	 * the kernel, so unless the daemon is aware of this file, ignore this
-	 * call.
-	 */
-	if (!get_fuse_inode(inode)->nodeid)
-		return;
-#endif
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1700,23 +1667,7 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_read_iter(iocb, to);
 
-#ifdef CONFIG_FUSE_BPF
-	{
-		struct fuse_err_ret fer;
-
-		fer = fuse_bpf_backing(inode, struct fuse_file_read_iter_io,
-				       fuse_file_read_iter_initialize,
-				       fuse_file_read_iter_backing,
-				       fuse_file_read_iter_finalize,
-				       iocb, to);
-		if (fer.ret)
-			return PTR_ERR(fer.result);
-	}
-#endif
-
-	if (ff->passthrough.filp)
-		return fuse_passthrough_read_iter(iocb, to);
-	else if (!(ff->open_flags & FOPEN_DIRECT_IO))
+	if (!(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_cache_read_iter(iocb, to);
 	else
 		return fuse_direct_read_iter(iocb, to);
@@ -1734,23 +1685,7 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_write_iter(iocb, from);
 
-#ifdef CONFIG_FUSE_BPF
-	{
-		struct fuse_err_ret fer;
-
-		fer = fuse_bpf_backing(inode, struct fuse_file_write_iter_io,
-				       fuse_file_write_iter_initialize,
-				       fuse_file_write_iter_backing,
-				       fuse_file_write_iter_finalize,
-				       iocb, from);
-		if (fer.ret)
-			return PTR_ERR(fer.result);
-	}
-#endif
-
-	if (ff->passthrough.filp)
-		return fuse_passthrough_write_iter(iocb, from);
-	else if (!(ff->open_flags & FOPEN_DIRECT_IO))
+	if (!(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_cache_write_iter(iocb, from);
 	else
 		return fuse_direct_write_iter(iocb, from);
@@ -1768,7 +1703,7 @@ static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 		__free_page(ap->pages[i]);
 
 	if (wpa->ia.ff)
-		fuse_file_put(wpa->inode, wpa->ia.ff, false, false);
+		fuse_file_put(wpa->ia.ff, false);
 
 	kfree(ap->pages);
 	kfree(wpa);
@@ -2002,19 +1937,6 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	struct fuse_file *ff;
 	int err;
 
-	/**
-	 * TODO - fully understand why this is necessary
-	 *
-	 * With fuse-bpf, fsstress fails if rename is enabled without this
-	 *
-	 * We are getting writes here on directory inodes, which do not have an
-	 * initialized file list so crash.
-	 *
-	 * The question is why we are getting those writes
-	 */
-	if (!S_ISREG(inode->i_mode))
-		return 0;
-
 	/*
 	 * Inode is always written before the last reference is dropped and
 	 * hence this should not be reached from reclaim.
@@ -2029,7 +1951,7 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	ff = __fuse_write_file_get(fi);
 	err = fuse_flush_times(inode, ff);
 	if (ff)
-		fuse_file_put(inode, ff, false, false);
+		fuse_file_put(ff, false);
 
 	return err;
 }
@@ -2427,7 +2349,7 @@ static int fuse_writepages(struct address_space *mapping,
 		fuse_writepages_send(&data);
 	}
 	if (data.ff)
-		fuse_file_put(inode, data.ff, false, false);
+		fuse_file_put(data.ff, false);
 
 	kfree(data.orig_pages);
 out:
@@ -2586,15 +2508,6 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if (FUSE_IS_DAX(file_inode(file)))
 		return fuse_dax_mmap(file, vma);
 
-#ifdef CONFIG_FUSE_BPF
-	/* TODO - this is simply passthrough, not a proper BPF filter */
-	if (ff->backing_file)
-		return fuse_backing_mmap(file, vma);
-#endif
-
-	if (ff->passthrough.filp)
-		return fuse_passthrough_mmap(file, vma);
-
 	if (ff->open_flags & FOPEN_DIRECT_IO) {
 		/* Can't provide the coherency needed for MAP_SHARED */
 		if (vma->vm_flags & VM_MAYSHARE)
@@ -2747,18 +2660,12 @@ static int fuse_file_flock(struct file *file, int cmd, struct file_lock *fl)
 {
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_file *ff = file->private_data;
 	int err;
-
-#ifdef CONFIG_FUSE_BPF
-	/* TODO - this is simply passthrough, not a proper BPF filter */
-	if (ff->backing_file)
-		return fuse_file_flock_backing(file, cmd, fl);
-#endif
 
 	if (fc->no_flock) {
 		err = locks_lock_file_wait(file, fl);
 	} else {
+		struct fuse_file *ff = file->private_data;
 
 		/* emulate flock with POSIX locks */
 		ff->flock = true;
@@ -2846,17 +2753,6 @@ static loff_t fuse_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	loff_t retval;
 	struct inode *inode = file_inode(file);
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(inode, struct fuse_lseek_io,
-			       fuse_lseek_initialize,
-			       fuse_lseek_backing,
-			       fuse_lseek_finalize,
-			       file, offset, whence);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
 
 	switch (whence) {
 	case SEEK_SET:
@@ -3147,18 +3043,6 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 		(!(mode & FALLOC_FL_KEEP_SIZE) ||
 		 (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)));
 
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(inode, struct fuse_fallocate_in,
-			       fuse_file_fallocate_initialize,
-			       fuse_file_fallocate_backing,
-			       fuse_file_fallocate_finalize,
-			       file, mode, offset, length);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
-
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
 		     FALLOC_FL_ZERO_RANGE))
 		return -EOPNOTSUPP;
@@ -3169,7 +3053,7 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 	inode_lock(inode);
 	if (block_faults) {
 		filemap_invalidate_lock(inode->i_mapping);
-		err = fuse_dax_break_layouts(inode, 0, 0);
+		err = fuse_dax_break_layouts(inode, 0, -1);
 		if (err)
 			goto out;
 	}
@@ -3252,7 +3136,7 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 		.nodeid_out = ff_out->nodeid,
 		.fh_out = ff_out->fh,
 		.off_out = pos_out,
-		.len = len,
+		.len = min_t(size_t, len, UINT_MAX & PAGE_MASK),
 		.flags = flags
 	};
 	struct fuse_write_out outarg;
@@ -3261,18 +3145,6 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 	 * extended */
 	bool is_unstable = (!fc->writeback_cache) &&
 			   ((pos_out + len) > inode_out->i_size);
-
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(file_in->f_inode, struct fuse_copy_file_range_io,
-			       fuse_copy_file_range_initialize,
-			       fuse_copy_file_range_backing,
-			       fuse_copy_file_range_finalize,
-			       file_in, pos_in, file_out, pos_out, len, flags);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
 
 	if (fc->no_copy_file_range)
 		return -EOPNOTSUPP;
@@ -3330,6 +3202,9 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 		fc->no_copy_file_range = 1;
 		err = -EOPNOTSUPP;
 	}
+	if (!err && outarg.size > len)
+		err = -EIO;
+
 	if (err)
 		goto out;
 

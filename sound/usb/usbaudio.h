@@ -12,15 +12,12 @@
 #define USB_ID_VENDOR(id) ((id) >> 16)
 #define USB_ID_PRODUCT(id) ((u16)(id))
 
-#include <linux/android_kabi.h>
-
 /*
  *
  */
 
 struct media_device;
 struct media_intf_devnode;
-struct snd_usb_substream;
 
 #define MAX_CARD_INTERFACES	16
 
@@ -64,11 +61,6 @@ struct snd_usb_audio {
 	struct usb_host_interface *ctrl_intf;	/* the audio control interface */
 	struct media_device *media_dev;
 	struct media_intf_devnode *ctl_intf_media_devnode;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 #define USB_AUDIO_IFACE_UNUSED	((void *)-1L)
@@ -188,6 +180,9 @@ extern bool snd_usb_skip_validation;
  *  for the given endpoint.
  * QUIRK_FLAG_MIC_RES_16 and QUIRK_FLAG_MIC_RES_384
  *  Set the fixed resolution for Mic Capture Volume (mostly for webcams)
+ * QUIRK_FLAG_MIXER_MIN_MUTE
+ *  Set minimum volume control value as mute for devices where the lowest
+ *  playback value represents muted state instead of minimum audible volume
  */
 
 #define QUIRK_FLAG_GET_SAMPLE_RATE	(1U << 0)
@@ -214,38 +209,6 @@ extern bool snd_usb_skip_validation;
 #define QUIRK_FLAG_FIXED_RATE		(1U << 21)
 #define QUIRK_FLAG_MIC_RES_16		(1U << 22)
 #define QUIRK_FLAG_MIC_RES_384		(1U << 23)
+#define QUIRK_FLAG_MIXER_MIN_MUTE	(1U << 24)
 
-struct audioformat;
-
-enum snd_vendor_pcm_open_close {
-	SOUND_PCM_CLOSE = 0,
-	SOUND_PCM_OPEN,
-};
-
-/**
- * struct snd_usb_audio_vendor_ops - function callbacks for USB audio accelerators
- * @set_interface: called when an interface is initialized
- * @set_pcm_intf: called when the pcm interface is set
- * @set_pcm_connection: called when pcm is opened/closed
- *
- * Set of callbacks for some accelerated USB audio streaming hardware.
- *
- * TODO: make this USB host-controller specific, right now this only works for
- * one USB controller in the system at a time, which is only realistic for
- * self-contained systems like phones.
- */
-struct snd_usb_audio_vendor_ops {
-	int (*set_interface)(struct usb_device *udev,
-			     struct usb_host_interface *alts,
-			     int iface, int alt);
-	int (*set_pcm_intf)(struct usb_interface *intf, int iface, int alt,
-			    int direction, struct snd_usb_substream *subs);
-	int (*set_pcm_connection)(struct usb_device *udev,
-				  enum snd_vendor_pcm_open_close onoff,
-				  int direction);
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-};
 #endif /* __USBAUDIO_H */

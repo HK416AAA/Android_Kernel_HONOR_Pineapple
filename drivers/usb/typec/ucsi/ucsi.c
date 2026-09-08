@@ -25,7 +25,7 @@
  * difficult to estimate the time it takes for the system to process the command
  * before it is actually passed to the PPM.
  */
-#define UCSI_TIMEOUT_MS		5000
+#define UCSI_TIMEOUT_MS		10000
 
 /*
  * UCSI_SWAP_TIMEOUT_MS - Timeout for role swap requests
@@ -76,16 +76,13 @@ static int ucsi_read_error(struct ucsi *ucsi)
 
 	switch (error) {
 	case UCSI_ERROR_INCOMPATIBLE_PARTNER:
-		dev_err(ucsi->dev, "incompatible partner unsupport\n");
 		return -EOPNOTSUPP;
 	case UCSI_ERROR_CC_COMMUNICATION_ERR:
-		dev_err(ucsi->dev, "cc communication err ecomm\n");
 		return -ECOMM;
 	case UCSI_ERROR_CONTRACT_NEGOTIATION_FAIL:
-		dev_err(ucsi->dev, "contract negotiation eproto\n");
 		return -EPROTO;
 	case UCSI_ERROR_DEAD_BATTERY:
-		dev_err(ucsi->dev, "Dead battery condition!\n");
+		dev_warn(ucsi->dev, "Dead battery condition!\n");
 		return -EPERM;
 	case UCSI_ERROR_INVALID_CON_NUM:
 	case UCSI_ERROR_UNREGONIZED_CMD:
@@ -93,26 +90,26 @@ static int ucsi_read_error(struct ucsi *ucsi)
 		dev_err(ucsi->dev, "possible UCSI driver bug %u\n", error);
 		return -EINVAL;
 	case UCSI_ERROR_OVERCURRENT:
-		dev_err(ucsi->dev, "Overcurrent condition\n");
+		dev_warn(ucsi->dev, "Overcurrent condition\n");
 		break;
 	case UCSI_ERROR_PARTNER_REJECTED_SWAP:
-		dev_err(ucsi->dev, "Partner rejected swap\n");
+		dev_warn(ucsi->dev, "Partner rejected swap\n");
 		break;
 	case UCSI_ERROR_HARD_RESET:
-		dev_err(ucsi->dev, "Hard reset occurred\n");
+		dev_warn(ucsi->dev, "Hard reset occurred\n");
 		break;
 	case UCSI_ERROR_PPM_POLICY_CONFLICT:
-		dev_err(ucsi->dev, "PPM Policy conflict\n");
+		dev_warn(ucsi->dev, "PPM Policy conflict\n");
 		break;
 	case UCSI_ERROR_SWAP_REJECTED:
-		dev_err(ucsi->dev, "Swap rejected\n");
+		dev_warn(ucsi->dev, "Swap rejected\n");
 		break;
 	case UCSI_ERROR_UNDEFINED:
 	default:
 		dev_err(ucsi->dev, "unknown error %u\n", error);
 		break;
 	}
-	dev_err(ucsi->dev, "error %u return -%d\n", error, EIO);
+
 	return -EIO;
 }
 
@@ -122,29 +119,23 @@ static int ucsi_exec_command(struct ucsi *ucsi, u64 cmd)
 	int ret;
 
 	ret = ucsi->ops->sync_write(ucsi, UCSI_CONTROL, &cmd, sizeof(cmd));
-	if (ret) {
-		dev_err(ucsi->dev, "sync_write error -%d\n", ret);
+	if (ret)
 		return ret;
-	}
 
 	ret = ucsi->ops->read(ucsi, UCSI_CCI, &cci, sizeof(cci));
-	if (ret) {
-		dev_err(ucsi->dev, "read cci error -%d\n", ret);
+	if (ret)
 		return ret;
-	}
 
 	if (cmd != UCSI_CANCEL && cci & UCSI_CCI_BUSY)
 		return ucsi_exec_command(ucsi, UCSI_CANCEL);
 
-	if (!(cci & UCSI_CCI_COMMAND_COMPLETE)) {
-		dev_err(ucsi->dev, "cci is not complete return -%d\n", EIO);
+	if (!(cci & UCSI_CCI_COMMAND_COMPLETE))
 		return -EIO;
-	}
 
 	if (cci & UCSI_CCI_NOT_SUPPORTED) {
 		if (ucsi_acknowledge(ucsi, false) < 0)
-			dev_err(ucsi->dev, "ACK of unsupported command failed\n");
-			dev_err(ucsi->dev, "cci is not support return -%d\n", EOPNOTSUPP);
+			dev_err(ucsi->dev,
+				"ACK of unsupported command failed\n");
 		return -EOPNOTSUPP;
 	}
 
@@ -153,7 +144,7 @@ static int ucsi_exec_command(struct ucsi *ucsi, u64 cmd)
 			ret = ucsi_acknowledge(ucsi, false);
 			if (ret)
 				return ret;
-			dev_err(ucsi->dev, "cci is error cmd get error status return -%d\n", EIO);
+
 			return -EIO;
 		}
 		return ucsi_read_error(ucsi);
@@ -792,13 +783,15 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 	struct ucsi_connector *con = container_of(work, struct ucsi_connector,
 						  work);
 	struct ucsi *ucsi = con->ucsi;
-	enum typec_role role;
+	enum typec_role role, prev_role;
 	u64 command;
 	int ret;
 
 	mutex_lock(&con->lock);
 
 	command = UCSI_GET_CONNECTOR_STATUS | UCSI_CONNECTOR_NUMBER(con->num);
+
+	prev_role = !!(con->status.flags & UCSI_CONSTAT_PWR_DIR);
 
 	ret = ucsi_send_command_common(ucsi, command, &con->status,
 				       sizeof(con->status), true);
@@ -813,8 +806,14 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 
 	role = !!(con->status.flags & UCSI_CONSTAT_PWR_DIR);
 
-	if (con->status.change & UCSI_CONSTAT_POWER_DIR_CHANGE) {
+	if ((con->status.change & UCSI_CONSTAT_POWER_DIR_CHANGE) && role != prev_role) {
 		typec_set_pwr_role(con->port, role);
+
+		/* Some power_supply properties vary depending on the power direction when
+		 * connected
+		 */
+		if (con->status.flags & UCSI_CONSTAT_CONNECTED)
+			ucsi_port_psy_changed(con);
 
 		/* Complete pending power role swap */
 		if (!completion_done(&con->complete))
@@ -850,10 +849,6 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 		ucsi_partner_task(con, ucsi_check_altmodes, 1, 0);
 
 out_unlock:
-	if (ret < 0) {
-		clear_bit(EVENT_PENDING, &con->ucsi->flags);
-		dev_err(ucsi->dev, "%s: ret < 0 (%d) clear flag", __func__, ret);
-	}
 	mutex_unlock(&con->lock);
 }
 
@@ -864,12 +859,21 @@ out_unlock:
  */
 void ucsi_connector_change(struct ucsi *ucsi, u8 num)
 {
-	struct ucsi_connector *con = &ucsi->connector[num - 1];
+	struct ucsi_connector *con;
 
 	if (!(ucsi->ntfy & UCSI_ENABLE_NTFY_CONNECTOR_CHANGE)) {
-		dev_err(ucsi->dev, "Bogus connector change event\n");
+		dev_dbg(ucsi->dev, "Early connector change event\n");
 		return;
 	}
+
+	if (!num || num > ucsi->cap.num_connectors) {
+		dev_warn_ratelimited(ucsi->dev,
+				     "Bogus connector change on %u (max %u)\n",
+				     num, ucsi->cap.num_connectors);
+		return;
+	}
+
+	con = &ucsi->connector[num - 1];
 
 	if (!test_and_set_bit(EVENT_PENDING, &ucsi->flags))
 		schedule_work(&con->work);
@@ -1116,6 +1120,7 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 	INIT_WORK(&con->work, ucsi_handle_connector_change);
 	init_completion(&con->complete);
 	mutex_init(&con->lock);
+	lockdep_set_class(&con->lock, &con->lock_key);
 	INIT_LIST_HEAD(&con->partner_tasks);
 	con->ucsi = ucsi;
 
@@ -1250,6 +1255,57 @@ out_unlock:
 	return ret;
 }
 
+static void ucsi_unregister_port(struct ucsi_connector *con)
+{
+	struct ucsi_work *uwork;
+
+	if (con->wq) {
+		mutex_lock(&con->lock);
+		ucsi_unregister_partner(con);
+		/*
+		 * queue delayed items immediately so they can execute
+		 * and free themselves before the wq is destroyed
+		 */
+		list_for_each_entry(uwork, &con->partner_tasks, node) {
+			if (cancel_delayed_work(&uwork->work))
+				queue_delayed_work(con->wq, &uwork->work, 0);
+		}
+		mutex_unlock(&con->lock);
+
+		destroy_workqueue(con->wq);
+		con->wq = NULL;
+	} else {
+		ucsi_unregister_partner(con);
+	}
+
+	ucsi_unregister_altmodes(con, UCSI_RECIPIENT_CON);
+	ucsi_unregister_port_psy(con);
+
+	typec_unregister_port(con->port);
+	con->port = NULL;
+}
+
+static u64 ucsi_get_supported_notifications(struct ucsi *ucsi)
+{
+	u8 features = ucsi->cap.features;
+	u64 ntfy = UCSI_ENABLE_NTFY_ALL;
+
+	if (!(features & UCSI_CAP_ALT_MODE_DETAILS))
+		ntfy &= ~UCSI_ENABLE_NTFY_CAM_CHANGE;
+
+	if (!(features & UCSI_CAP_PDO_DETAILS))
+		ntfy &= ~(UCSI_ENABLE_NTFY_PWR_LEVEL_CHANGE |
+			  UCSI_ENABLE_NTFY_CAP_CHANGE);
+
+	if (!(features & UCSI_CAP_EXT_SUPPLY_NOTIFICATIONS))
+		ntfy &= ~UCSI_ENABLE_NTFY_EXT_PWR_SRC_CHANGE;
+
+	if (!(features & UCSI_CAP_PD_RESET))
+		ntfy &= ~UCSI_ENABLE_NTFY_PD_RESET_COMPLETE;
+
+	return ntfy;
+}
+
 /**
  * ucsi_init - Initialize UCSI interface
  * @ucsi: UCSI to be initialized
@@ -1288,6 +1344,12 @@ static int ucsi_init(struct ucsi *ucsi)
 		ret = -ENODEV;
 		goto err_reset;
 	}
+	/* Check if reserved bit set. This is out of spec but happens in buggy FW */
+	if (ucsi->cap.num_connectors & 0x80) {
+		dev_warn(ucsi->dev, "UCSI: Invalid num_connectors %d. Likely buggy FW\n",
+			 ucsi->cap.num_connectors);
+		ucsi->cap.num_connectors &= 0x7f; // clear bit and carry on
+	}
 
 	/* Allocate the connectors. Released in ucsi_unregister() */
 	connector = kcalloc(ucsi->cap.num_connectors + 1, sizeof(*connector), GFP_KERNEL);
@@ -1295,6 +1357,9 @@ static int ucsi_init(struct ucsi *ucsi)
 		ret = -ENOMEM;
 		goto err_reset;
 	}
+
+	for (i = 0; i < ucsi->cap.num_connectors; i++)
+		lockdep_register_key(&connector[i].lock_key);
 
 	/* Register all connectors */
 	for (i = 0; i < ucsi->cap.num_connectors; i++) {
@@ -1304,8 +1369,8 @@ static int ucsi_init(struct ucsi *ucsi)
 			goto err_unregister;
 	}
 
-	/* Enable all notifications */
-	ntfy = UCSI_ENABLE_NTFY_ALL;
+	/* Enable all supported notifications */
+	ntfy = ucsi_get_supported_notifications(ucsi);
 	command = UCSI_SET_NOTIFICATION_ENABLE | ntfy;
 	ret = ucsi_send_command(ucsi, command, NULL, 0);
 	if (ret < 0)
@@ -1325,15 +1390,11 @@ static int ucsi_init(struct ucsi *ucsi)
 	return 0;
 
 err_unregister:
-	for (con = connector; con->port; con++) {
-		ucsi_unregister_partner(con);
-		ucsi_unregister_altmodes(con, UCSI_RECIPIENT_CON);
-		ucsi_unregister_port_psy(con);
-		if (con->wq)
-			destroy_workqueue(con->wq);
-		typec_unregister_port(con->port);
-		con->port = NULL;
-	}
+	for (con = connector; con->port; con++)
+		ucsi_unregister_port(con);
+	for (i = 0; i < ucsi->cap.num_connectors; i++)
+		lockdep_unregister_key(&connector[i].lock_key);
+
 	kfree(connector);
 err_reset:
 	memset(&ucsi->cap, 0, sizeof(ucsi->cap));
@@ -1363,6 +1424,26 @@ static void ucsi_resume_work(struct work_struct *work)
 		mutex_unlock(&con->lock);
 	}
 }
+
+int ucsi_suspend(struct ucsi *ucsi)
+{
+	int i;
+
+	/*
+	 * Cancel pending work so it cannot access the firmware after the ACPI
+	 * EC is stopped for suspend; state is re-read on resume.
+	 */
+	cancel_delayed_work_sync(&ucsi->work);
+
+	if (!ucsi->connector)
+		return 0;
+
+	for (i = 0; i < ucsi->cap.num_connectors; i++)
+		cancel_work_sync(&ucsi->connector[i].work);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ucsi_suspend);
 
 int ucsi_resume(struct ucsi *ucsi)
 {
@@ -1410,6 +1491,40 @@ void ucsi_set_drvdata(struct ucsi *ucsi, void *data)
 	ucsi->driver_data = data;
 }
 EXPORT_SYMBOL_GPL(ucsi_set_drvdata);
+
+/**
+ * ucsi_con_mutex_lock - Acquire the connector mutex
+ * @con: The connector interface to lock
+ *
+ * Returns true on success, false if the connector is disconnected
+ */
+bool ucsi_con_mutex_lock(struct ucsi_connector *con)
+{
+	bool mutex_locked = false;
+	bool connected = true;
+
+	while (connected && !mutex_locked) {
+		mutex_locked = mutex_trylock(&con->lock) != 0;
+		connected = con->status.flags & UCSI_CONSTAT_CONNECTED;
+		if (connected && !mutex_locked)
+			msleep(20);
+	}
+
+	connected = connected && con->partner;
+	if (!connected && mutex_locked)
+		mutex_unlock(&con->lock);
+
+	return connected;
+}
+
+/**
+ * ucsi_con_mutex_unlock - Release the connector mutex
+ * @con: The connector interface to unlock
+ */
+void ucsi_con_mutex_unlock(struct ucsi_connector *con)
+{
+	mutex_unlock(&con->lock);
+}
 
 /**
  * ucsi_create - Allocate UCSI instance
@@ -1492,25 +1607,8 @@ void ucsi_unregister(struct ucsi *ucsi)
 
 	for (i = 0; i < ucsi->cap.num_connectors; i++) {
 		cancel_work_sync(&ucsi->connector[i].work);
-		ucsi_unregister_partner(&ucsi->connector[i]);
-		ucsi_unregister_altmodes(&ucsi->connector[i],
-					 UCSI_RECIPIENT_CON);
-		ucsi_unregister_port_psy(&ucsi->connector[i]);
-
-		if (ucsi->connector[i].wq) {
-			struct ucsi_work *uwork;
-
-			mutex_lock(&ucsi->connector[i].lock);
-			/*
-			 * queue delayed items immediately so they can execute
-			 * and free themselves before the wq is destroyed
-			 */
-			list_for_each_entry(uwork, &ucsi->connector[i].partner_tasks, node)
-				mod_delayed_work(ucsi->connector[i].wq, &uwork->work, 0);
-			mutex_unlock(&ucsi->connector[i].lock);
-			destroy_workqueue(ucsi->connector[i].wq);
-		}
-		typec_unregister_port(ucsi->connector[i].port);
+		ucsi_unregister_port(&ucsi->connector[i]);
+		lockdep_unregister_key(&ucsi->connector[i].lock_key);
 	}
 
 	kfree(ucsi->connector);

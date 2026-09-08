@@ -90,7 +90,7 @@ bool set_capacity_and_notify(struct gendisk *disk, sector_t size)
 	    (disk->flags & GENHD_FL_HIDDEN))
 		return false;
 
-	pr_info("%s: detected capacity change from %lld to %lld\n",
+	pr_info_ratelimited("%s: detected capacity change from %lld to %lld\n",
 		disk->disk_name, capacity, size);
 
 	/*
@@ -740,7 +740,7 @@ static ssize_t disk_badblocks_store(struct device *dev,
 }
 
 #ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
-void blk_request_module(dev_t devt)
+static bool blk_probe_dev(dev_t devt)
 {
 	unsigned int major = MAJOR(devt);
 	struct blk_major_name **n;
@@ -750,14 +750,26 @@ void blk_request_module(dev_t devt)
 		if ((*n)->major == major && (*n)->probe) {
 			(*n)->probe(devt);
 			mutex_unlock(&major_names_lock);
-			return;
+			return true;
 		}
 	}
 	mutex_unlock(&major_names_lock);
+	return false;
+}
 
-	if (request_module("block-major-%d-%d", MAJOR(devt), MINOR(devt)) > 0)
-		/* Make old-style 2.4 aliases work */
-		request_module("block-major-%d", MAJOR(devt));
+void blk_request_module(dev_t devt)
+{
+	int error;
+
+	if (blk_probe_dev(devt))
+		return;
+
+	error = request_module("block-major-%d-%d", MAJOR(devt), MINOR(devt));
+	/* Make old-style 2.4 aliases work */
+	if (error > 0)
+		error = request_module("block-major-%d", MAJOR(devt));
+	if (!error)
+		blk_probe_dev(devt);
 }
 #endif /* CONFIG_BLOCK_LEGACY_AUTOLOAD */
 
@@ -1185,14 +1197,18 @@ static void disk_release(struct device *dev)
 	/*
 	 * To undo the all initialization from blk_mq_init_allocated_queue in
 	 * case of a probe failure where add_disk is never called we have to
-	 * call blk_mq_exit_queue here. We can't do this for the more common
-	 * teardown case (yet) as the tagset can be gone by the time the disk
-	 * is released once it was added.
+	 * call blk_mq_exit_queue here, after stopping the timer and work items
+	 * that I/O issued before add_disk may have left pending.  We can't do
+	 * this for the more common teardown case (yet) as the tagset can be
+	 * gone by the time the disk is released once it was added.
 	 */
 	if (queue_is_mq(disk->queue) &&
 	    test_bit(GD_OWNS_QUEUE, &disk->state) &&
-	    !test_bit(GD_ADDED, &disk->state))
+	    !test_bit(GD_ADDED, &disk->state)) {
+		blk_sync_queue(disk->queue);
+		blk_mq_cancel_work_sync(disk->queue);
 		blk_mq_exit_queue(disk->queue);
+	}
 
 	blkcg_exit_disk(disk);
 

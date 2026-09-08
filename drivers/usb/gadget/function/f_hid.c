@@ -21,11 +21,6 @@
 #include "u_hid.h"
 
 #define HIDG_MINORS	4
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-#include <linux/delay.h>
-#define HID_UEVENT_MAX 64
-extern struct device *g_honor_android_gadget_dev;
-#endif
 
 static int major, minors;
 static struct class *hidg_class;
@@ -82,12 +77,6 @@ struct f_hidg {
 
 	struct usb_ep			*in_ep;
 	struct usb_ep			*out_ep;
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	struct timespec64 tv_pending_to_send;
-	struct timespec64 tv_complete;
-	struct delayed_work dwork;
-	int x;
-#endif
 };
 
 static inline struct f_hidg *func_to_hidg(struct usb_function *f)
@@ -125,8 +114,8 @@ static struct hid_descriptor hidg_desc = {
 	.bcdHID				= cpu_to_le16(0x0101),
 	.bCountryCode			= 0x00,
 	.bNumDescriptors		= 0x1,
-	/*.desc[0].bDescriptorType	= DYNAMIC */
-	/*.desc[0].wDescriptorLenght	= DYNAMIC */
+	/*.rpt_desc.bDescriptorType	= DYNAMIC */
+	/*.rpt_desc.wDescriptorLength	= DYNAMIC */
 };
 
 /* Super-Speed Support */
@@ -426,27 +415,12 @@ static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct f_hidg *hidg = (struct f_hidg *)ep->driver_data;
 	unsigned long flags;
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	struct timespec64 tv_sub, tv_int;
-	long delta_ns, last_ns;
-#endif
 
 	if (req->status != 0) {
 		ERROR(hidg->func.config->cdev,
 			"End Point Request ERROR: %d\n", req->status);
 	}
 
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	ktime_get_real_ts64(&tv_int);
-	tv_sub = timespec64_sub(tv_int, hidg->tv_complete);
-	hidg->tv_complete = tv_int;
-	last_ns = timespec64_to_ns(&tv_sub);
-
-	tv_sub = timespec64_sub(hidg->tv_complete, hidg->tv_pending_to_send);
-	delta_ns = timespec64_to_ns(&tv_sub);
-
-	pr_info("%s: HID transport complete %ld ns, interval: %ld\n", __func__, delta_ns, last_ns);
-#endif
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 	hidg->write_pending = 0;
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
@@ -461,9 +435,6 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 	unsigned long flags;
 	ssize_t status = -ENOMEM;
 
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	ktime_get_real_ts64(&hidg->tv_pending_to_send);
-#endif
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 
 	if (!hidg->req) {
@@ -519,7 +490,7 @@ try_again:
 	}
 
 	req->status   = 0;
-	req->zero     = 0;
+	req->zero     = 1;
 	req->length   = count;
 	req->complete = f_hidg_req_complete;
 	req->context  = hidg;
@@ -666,9 +637,6 @@ static void hidg_ssreport_complete(struct usb_ep *ep, struct usb_request *req)
 	wake_up(&hidg->read_queue);
 }
 
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-static void hidg_dt_report_complete(struct usb_ep *ep, struct usb_request *req);
-#endif
 static int hidg_setup(struct usb_function *f,
 		const struct usb_ctrlrequest *ctrl)
 {
@@ -756,8 +724,8 @@ static int hidg_setup(struct usb_function *f,
 			struct hid_descriptor hidg_desc_copy = hidg_desc;
 
 			VDBG(cdev, "USB_REQ_GET_DESCRIPTOR: HID\n");
-			hidg_desc_copy.desc[0].bDescriptorType = HID_DT_REPORT;
-			hidg_desc_copy.desc[0].wDescriptorLength =
+			hidg_desc_copy.rpt_desc.bDescriptorType = HID_DT_REPORT;
+			hidg_desc_copy.rpt_desc.wDescriptorLength =
 				cpu_to_le16(hidg->report_desc_length);
 
 			length = min_t(unsigned short, length,
@@ -771,10 +739,6 @@ static int hidg_setup(struct usb_function *f,
 			length = min_t(unsigned short, length,
 						   hidg->report_desc_length);
 			memcpy(req->buf, hidg->report_desc, length);
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-			req->context = f;
-			req->complete = hidg_dt_report_complete;
-#endif
 			goto respond;
 			break;
 
@@ -797,51 +761,13 @@ stall:
 	return -EOPNOTSUPP;
 
 respond:
-	req->zero = 0;
+	req->zero = 1;
 	req->length = length;
 	status = usb_ep_queue(cdev->gadget->ep0, req, GFP_ATOMIC);
 	if (status < 0)
 		ERROR(cdev, "usb_ep_queue error on ep0 %d\n", value);
 	return status;
 }
-
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-static void hidg_dt_report_uevent_fn(struct work_struct *work)
-{
-	struct f_hidg *hidg = container_of(to_delayed_work(work), struct f_hidg, dwork);
-	char data[HID_UEVENT_MAX];
-	char *hidg_dt_report[2] = { &data[0], NULL };
-
-	if (!g_honor_android_gadget_dev) {
-		pr_info("%s g_honor_android_gadget_dev is NULL\n", __func__);
-		return;
-	}
-	snprintf(data, HID_UEVENT_MAX - 1, "HN_HID_DEVICE%d_CREATED=OK", hidg->x);
-	kobject_uevent_env(&g_honor_android_gadget_dev->kobj, KOBJ_CHANGE, hidg_dt_report);
-	pr_info("%s, HN_HID_DEVICE%d create succ\n", __func__, hidg->x);
-}
-
-static void hidg_dt_report_complete(struct usb_ep *ep, struct usb_request *req)
-{
-	struct usb_function *f;
-	const char *name;
-	struct f_hidg *hidg;
-	int i;
-
-	if (!req->context)
-		return;
-	f = req->context;
-	hidg = func_to_hidg(f);
-
-	if (!f->fi->group.cg_item.ci_name)
-		return;
-	name = f->fi->group.cg_item.ci_name;
-	if (1 != sscanf(name, "hid.gs%d", &i))
-		return;
-	hidg->x = i;
-	schedule_delayed_work(&hidg->dwork, msecs_to_jiffies(200));
-}
-#endif
 
 static void hidg_disable(struct usb_function *f)
 {
@@ -1040,8 +966,8 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
 	 * We can use hidg_desc struct here but we should not relay
 	 * that its content won't change after returning from this function.
 	 */
-	hidg_desc.desc[0].bDescriptorType = HID_DT_REPORT;
-	hidg_desc.desc[0].wDescriptorLength =
+	hidg_desc.rpt_desc.bDescriptorType = HID_DT_REPORT;
+	hidg_desc.rpt_desc.wDescriptorLength =
 		cpu_to_le16(hidg->report_desc_length);
 
 	hidg_hs_in_ep_desc.bEndpointAddress =
@@ -1070,24 +996,14 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
 	if (status)
 		goto fail;
 
-	spin_lock_init(&hidg->write_spinlock);
 	hidg->write_pending = 1;
 	hidg->req = NULL;
-	spin_lock_init(&hidg->read_spinlock);
-	init_waitqueue_head(&hidg->write_queue);
-	init_waitqueue_head(&hidg->read_queue);
-	INIT_LIST_HEAD(&hidg->completed_out_req);
 
 	/* create char device */
 	cdev_init(&hidg->cdev, &f_hidg_fops);
 	status = cdev_device_add(&hidg->cdev, &hidg->dev);
 	if (status)
 		goto fail_free_descs;
-
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	//pr_info("%s device_create succ hidg%d\n", __func__, hidg->minor);
-	usleep_range(8000, 18000);
-#endif
 
 	return 0;
 fail_free_descs:
@@ -1349,18 +1265,20 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	opts = container_of(fi, struct f_hid_opts, func_inst);
 
 	mutex_lock(&opts->lock);
-	++opts->refcnt;
+
+	spin_lock_init(&hidg->write_spinlock);
+	spin_lock_init(&hidg->read_spinlock);
+	init_waitqueue_head(&hidg->write_queue);
+	init_waitqueue_head(&hidg->read_queue);
+	INIT_LIST_HEAD(&hidg->completed_out_req);
 
 	device_initialize(&hidg->dev);
 	hidg->dev.release = hidg_release;
 	hidg->dev.class = hidg_class;
 	hidg->dev.devt = MKDEV(major, opts->minor);
 	ret = dev_set_name(&hidg->dev, "hidg%d", opts->minor);
-	if (ret) {
-		--opts->refcnt;
-		mutex_unlock(&opts->lock);
-		return ERR_PTR(ret);
-	}
+	if (ret)
+		goto err_put_device;
 
 	hidg->bInterfaceSubClass = opts->subclass;
 	hidg->bInterfaceProtocol = opts->protocol;
@@ -1371,14 +1289,13 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 					    opts->report_desc_length,
 					    GFP_KERNEL);
 		if (!hidg->report_desc) {
-			put_device(&hidg->dev);
-			--opts->refcnt;
-			mutex_unlock(&opts->lock);
-			return ERR_PTR(-ENOMEM);
+			ret = -ENOMEM;
+			goto err_put_device;
 		}
 	}
 	hidg->use_out_ep = !opts->no_out_endpoint;
 
+	++opts->refcnt;
 	mutex_unlock(&opts->lock);
 
 	hidg->func.name    = "hid";
@@ -1392,11 +1309,12 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	/* this could be made configurable at some point */
 	hidg->qlen	   = 4;
 
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-	INIT_DELAYED_WORK(&hidg->dwork, hidg_dt_report_uevent_fn);
-#endif
-
 	return &hidg->func;
+
+err_put_device:
+	put_device(&hidg->dev);
+	mutex_unlock(&opts->lock);
+	return ERR_PTR(ret);
 }
 
 DECLARE_USB_FUNCTION_INIT(hid, hidg_alloc_inst, hidg_alloc);

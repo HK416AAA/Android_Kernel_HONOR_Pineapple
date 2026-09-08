@@ -38,15 +38,12 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/compat.h>
+#include <linux/cleanup.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
 #include "internal.h"
 #include "swap.h"
-
-#ifdef CONFIG_HUGEPAGE_POOL
-#include <linux/hugepage_pool.h>
-#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/thp.h>
@@ -70,17 +67,10 @@ unsigned long transparent_hugepage_flags __read_mostly =
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
 	(1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-static struct shrinker *deferred_split_shrinker;
-static unsigned long deferred_split_count(struct shrinker *shrink,
-					  struct shrink_control *sc);
-static unsigned long deferred_split_scan(struct shrinker *shrink,
-					 struct shrink_control *sc);
-#else
 static struct shrinker deferred_split_shrinker;
-#endif
 
 static atomic_t huge_zero_refcount;
+static DEFINE_SPINLOCK(huge_zero_lock);
 struct page *huge_zero_page __read_mostly;
 unsigned long huge_zero_pfn __read_mostly = ~0UL;
 
@@ -166,7 +156,8 @@ bool hugepage_vma_check(struct vm_area_struct *vma, unsigned long vm_flags,
 static bool get_huge_zero_page(void)
 {
 	struct page *zero_page;
-retry:
+
+	/* Paired with atomic_set_release(). */
 	if (likely(atomic_inc_not_zero(&huge_zero_refcount)))
 		return true;
 
@@ -176,17 +167,22 @@ retry:
 		count_vm_event(THP_ZERO_PAGE_ALLOC_FAILED);
 		return false;
 	}
-	preempt_disable();
-	if (cmpxchg(&huge_zero_page, NULL, zero_page)) {
-		preempt_enable();
-		__free_pages(zero_page, compound_order(zero_page));
-		goto retry;
-	}
-	WRITE_ONCE(huge_zero_pfn, page_to_pfn(zero_page));
 
-	/* We take additional reference here. It will be put back by shrinker */
-	atomic_set(&huge_zero_refcount, 2);
-	preempt_enable();
+	/* Paired with critical section in shrink_huge_zero_page_scan(). */
+	spin_lock(&huge_zero_lock);
+	if (huge_zero_page) {
+		/* Somebody else already installed it. */
+		atomic_inc(&huge_zero_refcount);
+		spin_unlock(&huge_zero_lock);
+		__free_pages(zero_page, compound_order(zero_page));
+		return true;
+	}
+	WRITE_ONCE(huge_zero_page, zero_page);
+	WRITE_ONCE(huge_zero_pfn, page_to_pfn(zero_page));
+	/* Paired with atomic_inc_not_zero(). +1 for shrinker pin. */
+	atomic_set_release(&huge_zero_refcount, 2);
+	spin_unlock(&huge_zero_lock);
+
 	count_vm_event(THP_ZERO_PAGE_ALLOC);
 	return true;
 }
@@ -230,26 +226,29 @@ static unsigned long shrink_huge_zero_page_count(struct shrinker *shrink,
 static unsigned long shrink_huge_zero_page_scan(struct shrinker *shrink,
 				       struct shrink_control *sc)
 {
-	if (atomic_cmpxchg(&huge_zero_refcount, 1, 0) == 1) {
-		struct page *zero_page = xchg(&huge_zero_page, NULL);
-		BUG_ON(zero_page == NULL);
+	struct page *zero_page;
+
+	/* Paired with critical section in get_huge_zero_page(). */
+	scoped_guard(spinlock, &huge_zero_lock) {
+		/* Paired with atomic_inc_not_zero() in get_huge_zero_page(). */
+		if (atomic_cmpxchg(&huge_zero_refcount, 1, 0) != 1)
+			return 0;
+
+		zero_page = huge_zero_page;
+		VM_WARN_ON_ONCE(!zero_page);
+		WRITE_ONCE(huge_zero_page, NULL);
 		WRITE_ONCE(huge_zero_pfn, ~0UL);
-		__free_pages(zero_page, compound_order(zero_page));
-		return HPAGE_PMD_NR;
 	}
 
-	return 0;
+	__free_pages(zero_page, compound_order(zero_page));
+	return HPAGE_PMD_NR;
 }
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-static struct shrinker *huge_zero_page_shrinker;
-#else
 static struct shrinker huge_zero_page_shrinker = {
 	.count_objects = shrink_huge_zero_page_count,
 	.scan_objects = shrink_huge_zero_page_scan,
 	.seeks = DEFAULT_SEEKS,
 };
-#endif
 
 #ifdef CONFIG_SYSFS
 static ssize_t enabled_show(struct kobject *kobj,
@@ -470,40 +469,6 @@ static inline void hugepage_exit_sysfs(struct kobject *hugepage_kobj)
 }
 #endif /* CONFIG_SYSFS */
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-static int __init thp_shrinker_init(void)
-{
-	huge_zero_page_shrinker = shrinker_alloc(0, "thp-zero");
-	if (!huge_zero_page_shrinker)
-		return -ENOMEM;
-
-	deferred_split_shrinker = shrinker_alloc(SHRINKER_NUMA_AWARE |
-						 SHRINKER_MEMCG_AWARE |
-						 SHRINKER_NONSLAB,
-						 "thp-deferred_split");
-	if (!deferred_split_shrinker) {
-		shrinker_free(huge_zero_page_shrinker);
-		return -ENOMEM;
-	}
-
-	huge_zero_page_shrinker->count_objects = shrink_huge_zero_page_count;
-	huge_zero_page_shrinker->scan_objects = shrink_huge_zero_page_scan;
-	shrinker_register(huge_zero_page_shrinker);
-
-	deferred_split_shrinker->count_objects = deferred_split_count;
-	deferred_split_shrinker->scan_objects = deferred_split_scan;
-	shrinker_register(deferred_split_shrinker);
-
-	return 0;
-}
-
-static void __init thp_shrinker_exit(void)
-{
-	shrinker_free(huge_zero_page_shrinker);
-	shrinker_free(deferred_split_shrinker);
-}
-#endif
-
 static int __init hugepage_init(void)
 {
 	int err;
@@ -536,18 +501,12 @@ static int __init hugepage_init(void)
 	if (err)
 		goto err_slab;
 
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	err = thp_shrinker_init();
-	if (err)
-		goto err_shrinker;
-#else
 	err = register_shrinker(&huge_zero_page_shrinker, "thp-zero");
 	if (err)
 		goto err_hzp_shrinker;
 	err = register_shrinker(&deferred_split_shrinker, "thp-deferred_split");
 	if (err)
 		goto err_split_shrinker;
-#endif
 
 	/*
 	 * By default disable transparent hugepages on smaller systems,
@@ -564,19 +523,12 @@ static int __init hugepage_init(void)
 		goto err_khugepaged;
 
 	return 0;
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-err_khugepaged:
-	thp_shrinker_exit();
-err_shrinker:
-	khugepaged_destroy();
-#else
 err_khugepaged:
 	unregister_shrinker(&deferred_split_shrinker);
 err_split_shrinker:
 	unregister_shrinker(&huge_zero_page_shrinker);
 err_hzp_shrinker:
 	khugepaged_destroy();
-#endif
 err_slab:
 	hugepage_exit_sysfs(hugepage_kobj);
 err_sysfs:
@@ -711,16 +663,6 @@ unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
 	ret = __thp_get_unmapped_area(filp, addr, len, off, flags, PMD_SIZE);
 	if (ret)
 		return ret;
-
-#ifdef CONFIG_HUGEPAGE_POOL
-	ret = __thp_get_unmapped_area(filp, addr, len, off, flags, HPAGE_PMD_SIZE);
-	if (ret)
-		return ret;
-
-	ret = __thp_get_unmapped_area(filp, addr, len, off, flags, CONT_PTE_SIZE);
-	if (ret)
-		return ret;
-#endif
 
 	return current->mm->get_unmapped_area(filp, addr, len, pgoff, flags);
 }
@@ -906,11 +848,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 		return ret;
 	}
 	gfp = vma_thp_gfp_mask(vma);
-#ifdef CONFIG_HUGEPAGE_POOL
-	folio = alloc_hgfolio(HPAGE_PMD_ORDER, HPAGE_ANON);
-	if (!folio)
-#endif
-		folio = vma_alloc_folio(gfp, HPAGE_PMD_ORDER, vma, haddr, true);
+	folio = vma_alloc_folio(gfp, HPAGE_PMD_ORDER, vma, haddr, true);
 	if (unlikely(!folio)) {
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
@@ -1990,146 +1928,6 @@ unlock:
 	return ret;
 }
 
-#ifdef CONFIG_USERFAULTFD
-/*
- * The PT lock for src_pmd and dst_vma/src_vma (for reading) are locked by
- * the caller, but it must return after releasing the page_table_lock.
- * Just move the page from src_pmd to dst_pmd if possible.
- * Return zero if succeeded in moving the page, -EAGAIN if it needs to be
- * repeated by the caller, or other errors in case of failure.
- */
-int move_pages_huge_pmd(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd, pmd_t dst_pmdval,
-			struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-			unsigned long dst_addr, unsigned long src_addr)
-{
-	pmd_t _dst_pmd, src_pmdval;
-	struct page *src_page;
-	struct folio *src_folio;
-	struct anon_vma *src_anon_vma;
-	spinlock_t *src_ptl, *dst_ptl;
-	pgtable_t src_pgtable;
-	struct mmu_notifier_range range;
-	int err = 0;
-
-	src_pmdval = *src_pmd;
-	src_ptl = pmd_lockptr(mm, src_pmd);
-
-	lockdep_assert_held(src_ptl);
-	vma_assert_locked(src_vma);
-	vma_assert_locked(dst_vma);
-
-	/* Sanity checks before the operation */
-	if (WARN_ON_ONCE(!pmd_none(dst_pmdval)) || WARN_ON_ONCE(src_addr & ~HPAGE_PMD_MASK) ||
-	    WARN_ON_ONCE(dst_addr & ~HPAGE_PMD_MASK)) {
-		spin_unlock(src_ptl);
-		return -EINVAL;
-	}
-
-	if (!pmd_trans_huge(src_pmdval)) {
-		spin_unlock(src_ptl);
-		if (is_pmd_migration_entry(src_pmdval)) {
-			pmd_migration_entry_wait(mm, &src_pmdval);
-			return -EAGAIN;
-		}
-		return -ENOENT;
-	}
-
-	src_page = pmd_page(src_pmdval);
-
-	if (!is_huge_zero_pmd(src_pmdval)) {
-		if (unlikely(!PageAnonExclusive(src_page))) {
-			spin_unlock(src_ptl);
-			return -EBUSY;
-		}
-
-		src_folio = page_folio(src_page);
-		folio_get(src_folio);
-	} else
-		src_folio = NULL;
-
-	spin_unlock(src_ptl);
-
-	flush_cache_range(src_vma, src_addr, src_addr + HPAGE_PMD_SIZE);
-	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, src_vma, mm, src_addr,
-				src_addr + HPAGE_PMD_SIZE);
-	mmu_notifier_invalidate_range_start(&range);
-
-	if (src_folio) {
-		folio_lock(src_folio);
-
-		/*
-		 * split_huge_page walks the anon_vma chain without the page
-		 * lock. Serialize against it with the anon_vma lock, the page
-		 * lock is not enough.
-		 */
-		src_anon_vma = folio_get_anon_vma(src_folio);
-		if (!src_anon_vma) {
-			err = -EAGAIN;
-			goto unlock_folio;
-		}
-		anon_vma_lock_write(src_anon_vma);
-	} else
-		src_anon_vma = NULL;
-
-	dst_ptl = pmd_lockptr(mm, dst_pmd);
-	double_pt_lock(src_ptl, dst_ptl);
-	if (unlikely(!pmd_same(*src_pmd, src_pmdval) ||
-		     !pmd_same(*dst_pmd, dst_pmdval))) {
-		err = -EAGAIN;
-		goto unlock_ptls;
-	}
-	if (src_folio) {
-		if (folio_maybe_dma_pinned(src_folio) ||
-		    !PageAnonExclusive(&src_folio->page)) {
-			err = -EBUSY;
-			goto unlock_ptls;
-		}
-
-		if (WARN_ON_ONCE(!folio_test_head(src_folio)) ||
-		    WARN_ON_ONCE(!folio_test_anon(src_folio))) {
-			err = -EBUSY;
-			goto unlock_ptls;
-		}
-
-		src_pmdval = pmdp_huge_clear_flush(src_vma, src_addr, src_pmd);
-		/* Folio got pinned from under us. Put it back and fail the move. */
-		if (folio_maybe_dma_pinned(src_folio)) {
-			set_pmd_at(mm, src_addr, src_pmd, src_pmdval);
-			err = -EBUSY;
-			goto unlock_ptls;
-		}
-
-		page_move_anon_rmap(&src_folio->page, dst_vma);
-		WRITE_ONCE(src_folio->index, linear_page_index(dst_vma, dst_addr));
-
-		_dst_pmd = mk_huge_pmd(&src_folio->page, dst_vma->vm_page_prot);
-		/* Follow mremap() behavior and treat the entry dirty after the move */
-		_dst_pmd = pmd_mkwrite(pmd_mkdirty(_dst_pmd));
-	} else {
-		src_pmdval = pmdp_huge_clear_flush(src_vma, src_addr, src_pmd);
-		_dst_pmd = mk_huge_pmd(src_page, dst_vma->vm_page_prot);
-	}
-	set_pmd_at(mm, dst_addr, dst_pmd, _dst_pmd);
-
-	src_pgtable = pgtable_trans_huge_withdraw(mm, src_pmd);
-	pgtable_trans_huge_deposit(mm, dst_pmd, src_pgtable);
-unlock_ptls:
-	double_pt_unlock(src_ptl, dst_ptl);
-	if (src_anon_vma) {
-		anon_vma_unlock_write(src_anon_vma);
-		put_anon_vma(src_anon_vma);
-	}
-unlock_folio:
-	/* unblock rmap walks */
-	if (src_folio)
-		folio_unlock(src_folio);
-	mmu_notifier_invalidate_range_end(&range);
-	if (src_folio)
-		folio_put(src_folio);
-	return err;
-}
-#endif /* CONFIG_USERFAULTFD */
-
 /*
  * Returns page table lock pointer if a given pmd maps a thp, NULL otherwise.
  *
@@ -2146,7 +1944,6 @@ spinlock_t *__pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma)
 	spin_unlock(ptl);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(__pmd_trans_huge_lock);
 
 /*
  * Returns page table lock pointer if a given pud maps a thp, NULL otherwise.
@@ -2303,7 +2100,9 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			if (!PageReferenced(page) && pmd_young(old_pmd))
 				SetPageReferenced(page);
 			page_remove_rmap(page, vma, true);
+			add_mm_counter(mm, mm_counter_file(page), -HPAGE_PMD_NR);
 			put_page(page);
+			return;
 		}
 		add_mm_counter(mm, mm_counter_file(page), -HPAGE_PMD_NR);
 		return;
@@ -2500,12 +2299,14 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 {
 	spinlock_t *ptl;
 	struct mmu_notifier_range range;
+	bool pmd_migration;
 
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,
 				address & HPAGE_PMD_MASK,
 				(address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE);
 	mmu_notifier_invalidate_range_start(&range);
 	ptl = pmd_lock(vma->vm_mm, pmd);
+	pmd_migration = is_pmd_migration_entry(*pmd);
 
 	/*
 	 * If caller asks to setup a migration entry, we need a folio to check
@@ -2514,13 +2315,12 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 	VM_BUG_ON(freeze && !folio);
 	VM_WARN_ON_ONCE(folio && !folio_test_locked(folio));
 
-	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd) ||
-	    is_pmd_migration_entry(*pmd)) {
+	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd) || pmd_migration) {
 		/*
-		 * It's safe to call pmd_page when folio is set because it's
-		 * guaranteed that pmd is present.
+		 * Do not apply pmd_folio() to a migration entry; and folio lock
+		 * guarantees that it must be of the wrong folio anyway.
 		 */
-		if (folio && folio != page_folio(pmd_page(*pmd)))
+		if (folio && (pmd_migration || folio != page_folio(pmd_page(*pmd))))
 			goto out;
 		__split_huge_pmd_locked(vma, pmd, range.start, freeze);
 	}
@@ -2542,9 +2342,6 @@ out:
 	 */
 	mmu_notifier_invalidate_range_only_end(&range);
 }
-#if IS_ENABLED(CONFIG_FMPS)
-EXPORT_SYMBOL_GPL(__split_huge_pmd);
-#endif
 
 void split_huge_pmd_address(struct vm_area_struct *vma, unsigned long address,
 		bool freeze, struct folio *folio)
@@ -2734,7 +2531,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
 }
 
 static void __split_huge_page(struct page *page, struct list_head *list,
-		pgoff_t end)
+		pgoff_t end, struct address_space *mapping)
 {
 	struct folio *folio = page_folio(page);
 	struct page *head = &folio->page;
@@ -2811,6 +2608,16 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 
 		split_swap_cluster(entry);
 	}
+
+	/*
+	 * Drop the mapping while the head page is still locked and thus pins
+	 * the inode. The loop below may free the after-split subpages --
+	 * including the head, when @page is a tail beyond EOF that the split
+	 * dropped from the page cache -- which could otherwise let the inode,
+	 * and @mapping, be freed before this unlock.
+	 */
+	if (mapping)
+		i_mmap_unlock_read(mapping);
 
 	for (i = 0; i < nr; i++) {
 		struct page *subpage = head + i;
@@ -2992,7 +2799,9 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 			}
 		}
 
-		__split_huge_page(page, list, end);
+		__split_huge_page(page, list, end, mapping);
+		/* __split_huge_page() dropped the i_mmap lock */
+		mapping = NULL;
 		ret = 0;
 	} else {
 		spin_unlock(&ds_queue->split_queue_lock);
@@ -3063,15 +2872,9 @@ void deferred_split_huge_page(struct page *page)
 		list_add_tail(page_deferred_list(page), &ds_queue->split_queue);
 		ds_queue->split_queue_len++;
 #ifdef CONFIG_MEMCG
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-		if (memcg)
-			set_shrinker_bit(memcg, page_to_nid(page),
-					 deferred_split_shrinker->id);
-#else
 		if (memcg)
 			set_shrinker_bit(memcg, page_to_nid(page),
 					 deferred_split_shrinker.id);
-#endif
 #endif
 	}
 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
@@ -3147,7 +2950,6 @@ next:
 	return split;
 }
 
-#ifndef CONFIG_SHRINKER_LOCKLESS_OPT
 static struct shrinker deferred_split_shrinker = {
 	.count_objects = deferred_split_count,
 	.scan_objects = deferred_split_scan,
@@ -3155,7 +2957,6 @@ static struct shrinker deferred_split_shrinker = {
 	.flags = SHRINKER_NUMA_AWARE | SHRINKER_MEMCG_AWARE |
 		 SHRINKER_NONSLAB,
 };
-#endif
 
 #ifdef CONFIG_DEBUG_FS
 static void split_huge_pages_all(void)

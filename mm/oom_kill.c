@@ -45,6 +45,7 @@
 #include <linux/init.h>
 #include <linux/mmu_notifier.h>
 #include <linux/cred.h>
+#include <linux/nmi.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -53,16 +54,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/oom.h>
 
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-#include <linux/rainbow_reason.h>
-#endif
-
-#if (IS_BUILTIN(CONFIG_LOGGER) && IS_ENABLED(CONFIG_LOG_JANK))
-#include <log/log_jank.h>
-#endif
-
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/mm.h>
 static int sysctl_panic_on_oom;
 static int sysctl_oom_kill_allocating_task;
 static int sysctl_oom_dump_tasks = 1;
@@ -431,7 +422,7 @@ static int dump_task(struct task_struct *p, void *arg)
  * State information includes task's pid, uid, tgid, vm size, rss,
  * pgtables_bytes, swapents, oom_score_adj value, and name.
  */
-void dump_tasks(struct oom_control *oc)
+static void dump_tasks(struct oom_control *oc)
 {
 	pr_info("Tasks state (memory values in pages):\n");
 	pr_info("[  pid  ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name\n");
@@ -440,14 +431,18 @@ void dump_tasks(struct oom_control *oc)
 		mem_cgroup_scan_tasks(oc->memcg, dump_task, oc);
 	else {
 		struct task_struct *p;
+		int i = 0;
 
 		rcu_read_lock();
-		for_each_process(p)
+		for_each_process(p) {
+			/* Avoid potential softlockup warning */
+			if ((++i & 1023) == 0)
+				touch_softlockup_watchdog();
 			dump_task(p, oc);
+		}
 		rcu_read_unlock();
 	}
 }
-EXPORT_SYMBOL_GPL(dump_tasks);
 
 static void dump_oom_summary(struct oom_control *oc, struct task_struct *victim)
 {
@@ -521,7 +516,7 @@ static DECLARE_WAIT_QUEUE_HEAD(oom_reaper_wait);
 static struct task_struct *oom_reaper_list;
 static DEFINE_SPINLOCK(oom_reaper_lock);
 
-bool __oom_reap_task_mm(struct mm_struct *mm)
+static bool __oom_reap_task_mm(struct mm_struct *mm)
 {
 	struct vm_area_struct *vma;
 	bool ret = true;
@@ -535,7 +530,6 @@ bool __oom_reap_task_mm(struct mm_struct *mm)
 	 */
 	set_bit(MMF_UNSTABLE, &mm->flags);
 
-	trace_android_vh_oom_swapmem_gather_init(mm);
 	for_each_vma(vmi, vma) {
 		if (vma->vm_flags & (VM_HUGETLB|VM_PFNMAP))
 			continue;
@@ -568,11 +562,9 @@ bool __oom_reap_task_mm(struct mm_struct *mm)
 			tlb_finish_mmu(&tlb);
 		}
 	}
-	trace_android_vh_oom_swapmem_gather_finish(mm);
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(__oom_reap_task_mm);
 
 /*
  * Reaps the address space of the give task.
@@ -761,19 +753,6 @@ static inline void queue_oom_reaper(struct task_struct *tsk)
 #endif /* CONFIG_MMU */
 
 /**
- * tsk->mm has to be non NULL and caller has to guarantee it is stable (either
- * under task_lock or operate on the current).
- */
-static void __mark_oom_victim(struct task_struct *tsk)
-{
-	struct mm_struct *mm = tsk->mm;
-
-	if (!cmpxchg(&tsk->signal->oom_mm, NULL, mm)) {
-		mmgrab(tsk->signal->oom_mm);
-	}
-}
-
-/**
  * mark_oom_victim - mark the given task as OOM victim
  * @tsk: task to mark
  *
@@ -786,6 +765,7 @@ static void __mark_oom_victim(struct task_struct *tsk)
 static void mark_oom_victim(struct task_struct *tsk)
 {
 	const struct cred *cred;
+	struct mm_struct *mm = tsk->mm;
 
 	WARN_ON(oom_killer_disabled);
 	/* OOM killer might race with memcg OOM */
@@ -793,7 +773,8 @@ static void mark_oom_victim(struct task_struct *tsk)
 		return;
 
 	/* oom_mm is bound to the signal struct life time. */
-	__mark_oom_victim(tsk);
+	if (!cmpxchg(&tsk->signal->oom_mm, NULL, mm))
+		mmgrab(tsk->signal->oom_mm);
 
 	/*
 	 * Make sure that the task is woken up from uninterruptible sleep
@@ -975,10 +956,6 @@ static void __oom_kill_process(struct task_struct *victim, const char *message)
 	 */
 	do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID);
 	mark_oom_victim(victim);
-#if (IS_BUILTIN(CONFIG_LOGGER) && IS_ENABLED(CONFIG_LOG_JANK))
-	LOG_JANK_D(JLID_KERNEL_OOM, "#ARG1:<%s>#ARG2:<%d>", victim->comm,
-		task_pid_nr(victim));
-#endif
 	pr_err("%s: Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%hd\n",
 		message, task_pid_nr(victim), victim->comm, K(mm->total_vm),
 		K(get_mm_counter(mm, MM_ANONPAGES)),
@@ -1108,11 +1085,6 @@ static void check_panic_on_oom(struct oom_control *oc)
 	/* Do not panic for oom kills triggered by sysrq */
 	if (is_sysrq_oom(oc))
 		return;
-
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-	rb_sreason_set("out_of_memory");
-#endif
-
 	dump_header(oc, NULL);
 	panic("Out of memory: %s panic_on_oom is enabled\n",
 		sysctl_panic_on_oom == 2 ? "compulsory" : "system-wide");
@@ -1205,12 +1177,8 @@ bool out_of_memory(struct oom_control *oc)
 		 * system level, we cannot survive this and will enter
 		 * an endless loop in the allocator. Bail out now.
 		 */
-		if (!is_sysrq_oom(oc) && !is_memcg_oom(oc)) {
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-			rb_sreason_set("deadlocked_mem");
-#endif
+		if (!is_sysrq_oom(oc) && !is_memcg_oom(oc))
 			panic("System is deadlocked on memory\n");
-		}
 	}
 	if (oc->chosen && oc->chosen != (void *)-1UL)
 		oom_kill_process(oc, !is_memcg_oom(oc) ? "Out of memory" :
@@ -1301,17 +1269,4 @@ put_task:
 #else
 	return -ENOSYS;
 #endif /* CONFIG_MMU */
-}
-
-void add_to_oom_reaper(struct task_struct *p)
-{
-	p = find_lock_task_mm(p);
-	if (!p)
-		return;
-
-	if (task_will_free_mem(p)) {
-		__mark_oom_victim(p);
-		queue_oom_reaper(p);
-	}
-	task_unlock(p);
 }

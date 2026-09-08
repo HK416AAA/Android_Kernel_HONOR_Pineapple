@@ -247,9 +247,9 @@ int cifs_try_adding_channels(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses)
 				cifs_dbg(VFS, "failed to open extra channel on iface:%pIS rc=%d\n",
 					 &iface->sockaddr,
 					 rc);
-				kref_put(&iface->refcount, release_iface);
 				/* failure to add chan should increase weight */
 				iface->weight_fulfilled++;
+				kref_put(&iface->refcount, release_iface);
 				continue;
 			}
 
@@ -278,6 +278,64 @@ int cifs_try_adding_channels(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses)
 }
 
 /*
+ * called when multichannel is disabled by the server.
+ * this always gets called from smb2_reconnect
+ * and cannot get called in parallel threads.
+ */
+void
+cifs_disable_secondary_channels(struct cifs_ses *ses)
+{
+	int i, chan_count;
+	struct TCP_Server_Info *server;
+	struct cifs_server_iface *iface;
+
+	spin_lock(&ses->chan_lock);
+	chan_count = ses->chan_count;
+	if (chan_count == 1)
+		goto done;
+
+	ses->chan_count = 1;
+
+	/* for all secondary channels reset the need reconnect bit */
+	ses->chans_need_reconnect &= 1;
+
+	for (i = 1; i < chan_count; i++) {
+		iface = ses->chans[i].iface;
+		server = ses->chans[i].server;
+
+		/*
+		 * remove these references first, since we need to unlock
+		 * the chan_lock here, since iface_lock is a higher lock
+		 */
+		ses->chans[i].iface = NULL;
+		ses->chans[i].server = NULL;
+		spin_unlock(&ses->chan_lock);
+
+		if (iface) {
+			spin_lock(&ses->iface_lock);
+			kref_put(&iface->refcount, release_iface);
+			iface->num_channels--;
+			if (iface->weight_fulfilled)
+				iface->weight_fulfilled--;
+			spin_unlock(&ses->iface_lock);
+		}
+
+		if (server) {
+			if (!server->terminate) {
+				server->terminate = true;
+				cifs_signal_cifsd_for_reconnect(server, false);
+			}
+			cifs_put_tcp_session(server, false);
+		}
+
+		spin_lock(&ses->chan_lock);
+	}
+
+done:
+	spin_unlock(&ses->chan_lock);
+}
+
+/*
  * update the iface for the channel if necessary.
  * will return 0 when iface is updated, 1 if removed, 2 otherwise
  * Must be called with chan_lock held.
@@ -292,6 +350,7 @@ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
 	struct cifs_server_iface *last_iface = NULL;
 	struct sockaddr_storage ss;
 	int rc = 0;
+	int retry = 0;
 
 	spin_lock(&ses->chan_lock);
 	chan_index = cifs_ses_get_chan_index(ses, server);
@@ -320,6 +379,7 @@ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
 		return 0;
 	}
 
+try_again:
 	last_iface = list_last_entry(&ses->iface_list, struct cifs_server_iface,
 				     iface_head);
 	iface_min_speed = last_iface->speed;
@@ -358,6 +418,13 @@ cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
 
 	if (list_entry_is_head(iface, &ses->iface_list, iface_head)) {
 		rc = 1;
+		list_for_each_entry(iface, &ses->iface_list, iface_head)
+			iface->weight_fulfilled = 0;
+
+		/* see if it can be satisfied in second attempt */
+		if (!retry++)
+			goto try_again;
+
 		iface = NULL;
 		cifs_dbg(FYI, "unable to find a suitable iface\n");
 	}
@@ -561,15 +628,10 @@ cifs_ses_add_channel(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses,
 
 out:
 	if (rc && chan->server) {
-		/*
-		 * we should avoid race with these delayed works before we
-		 * remove this channel
-		 */
-		cancel_delayed_work_sync(&chan->server->echo);
-		cancel_delayed_work_sync(&chan->server->resolve);
-		cancel_delayed_work_sync(&chan->server->reconnect);
+		cifs_put_tcp_session(chan->server, 0);
 
 		spin_lock(&ses->chan_lock);
+
 		/* we rely on all bits beyond chan_count to be clear */
 		cifs_chan_clear_need_reconnect(ses, chan->server);
 		ses->chan_count--;
@@ -579,8 +641,6 @@ out:
 		 */
 		WARN_ON(ses->chan_count < 1);
 		spin_unlock(&ses->chan_lock);
-
-		cifs_put_tcp_session(chan->server, 0);
 	}
 
 	free_xid(xid);
@@ -605,6 +665,7 @@ static __u32 cifs_ssetup_hdr(struct cifs_ses *ses,
 					USHRT_MAX));
 	pSMB->req.MaxMpxCount = cpu_to_le16(server->maxReq);
 	pSMB->req.VcNumber = cpu_to_le16(1);
+	pSMB->req.SessionKey = server->session_key_id;
 
 	/* Now no need to set SMBFLG_CASELESS or obsolete CANONICAL PATH */
 
@@ -1209,12 +1270,13 @@ cifs_select_sectype(struct TCP_Server_Info *server, enum securityEnum requested)
 		switch (requested) {
 		case Kerberos:
 		case RawNTLMSSP:
+		case IAKerb:
 			return requested;
 		case Unspecified:
 			if (server->sec_ntlmssp &&
 			    (global_secflags & CIFSSEC_MAY_NTLMSSP))
 				return RawNTLMSSP;
-			if ((server->sec_kerberos || server->sec_mskerberos) &&
+			if ((server->sec_kerberos || server->sec_mskerberos || server->sec_iakerb) &&
 			    (global_secflags & CIFSSEC_MAY_KRB5))
 				return Kerberos;
 			fallthrough;

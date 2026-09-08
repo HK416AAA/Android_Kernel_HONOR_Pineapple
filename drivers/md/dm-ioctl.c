@@ -87,7 +87,9 @@ static struct hash_cell *__get_name_cell(const char *str)
 
 	while (n) {
 		struct hash_cell *hc = container_of(n, struct hash_cell, name_node);
-		int c = strcmp(hc->name, str);
+		int c;
+
+		c = strcmp(hc->name, str);
 		if (!c) {
 			dm_get(hc->md);
 			return hc;
@@ -104,7 +106,9 @@ static struct hash_cell *__get_uuid_cell(const char *str)
 
 	while (n) {
 		struct hash_cell *hc = container_of(n, struct hash_cell, uuid_node);
-		int c = strcmp(hc->uuid, str);
+		int c;
+
+		c = strcmp(hc->uuid, str);
 		if (!c) {
 			dm_get(hc->md);
 			return hc;
@@ -144,7 +148,9 @@ static void __link_name(struct hash_cell *new_hc)
 
 	while (*n) {
 		struct hash_cell *hc = container_of(*n, struct hash_cell, name_node);
-		int c = strcmp(hc->name, new_hc->name);
+		int c;
+
+		c = strcmp(hc->name, new_hc->name);
 		BUG_ON(!c);
 		parent = *n;
 		n = c >= 0 ? &hc->name_node.rb_left : &hc->name_node.rb_right;
@@ -167,7 +173,9 @@ static void __link_uuid(struct hash_cell *new_hc)
 
 	while (*n) {
 		struct hash_cell *hc = container_of(*n, struct hash_cell, uuid_node);
-		int c = strcmp(hc->uuid, new_hc->uuid);
+		int c;
+
+		c = strcmp(hc->uuid, new_hc->uuid);
 		BUG_ON(!c);
 		parent = *n;
 		n = c > 0 ? &hc->uuid_node.rb_left : &hc->uuid_node.rb_right;
@@ -367,7 +375,7 @@ retry:
 
 	up_write(&_hash_lock);
 
-	if (dev_skipped)
+	if (dev_skipped && !only_deferred)
 		DMWARN("remove_all left %d open device(s)", dev_skipped);
 }
 
@@ -611,6 +619,7 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
 	 */
 	for (n = rb_first(&name_rb_tree); n; n = rb_next(n)) {
 		void *uuid_ptr;
+
 		hc = container_of(n, struct hash_cell, name_node);
 		if (!filter_device(hc, param->name, param->uuid))
 			continue;
@@ -840,6 +849,7 @@ static void __dev_status(struct mapped_device *md, struct dm_ioctl *param)
 
 	if (param->flags & DM_QUERY_INACTIVE_TABLE_FLAG) {
 		int srcu_idx;
+
 		table = dm_get_inactive_table(md, &srcu_idx);
 		if (table) {
 			if (!(dm_table_get_mode(table) & FMODE_WRITE))
@@ -1316,6 +1326,10 @@ static void retrieve_status(struct dm_table *table,
 		used = param->data_start + (outptr - outbuf);
 
 		outptr = align_ptr(outptr);
+		if (!outptr || outptr > outbuf + len) {
+			param->flags |= DM_BUFFER_FULL_FLAG;
+			break;
+		}
 		spec->next = outptr - outbuf;
 	}
 
@@ -1733,8 +1747,11 @@ static int target_message(struct file *filp, struct dm_ioctl *param, size_t para
 		goto out_argv;
 
 	table = dm_get_live_table(md, &srcu_idx);
-	if (!table)
+	if (!table) {
+		DMERR("The device has no table.");
+		r = -EINVAL;
 		goto out_table;
+	}
 
 	if (dm_deleting_md(md)) {
 		r = -ENXIO;
@@ -2266,7 +2283,7 @@ int __init dm_early_create(struct dm_ioctl *dmi,
 	/* resume device */
 	r = dm_resume(md);
 	if (r)
-		goto err_destroy_table;
+		goto err_hash_remove;
 
 	DMINFO("%s (%s) is ready", md->disk->disk_name, dmi->name);
 	dm_put(md);

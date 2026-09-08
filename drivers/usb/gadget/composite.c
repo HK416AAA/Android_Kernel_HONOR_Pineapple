@@ -316,7 +316,7 @@ int usb_add_function(struct usb_configuration *config,
 {
 	int	value = -EINVAL;
 
-	INFO(config->cdev, "adding '%s'/%p to config '%s'/%p\n",
+	DBG(config->cdev, "adding '%s'/%p to config '%s'/%p\n",
 			function->name, function,
 			config->label, config);
 
@@ -358,7 +358,7 @@ int usb_add_function(struct usb_configuration *config,
 
 done:
 	if (value)
-		INFO(config->cdev, "adding '%s'/%p --> %d\n",
+		DBG(config->cdev, "adding '%s'/%p --> %d\n",
 				function->name, function, value);
 	return value;
 }
@@ -371,12 +371,8 @@ void usb_remove_function(struct usb_configuration *c, struct usb_function *f)
 
 	bitmap_zero(f->endpoints, 32);
 	list_del(&f->list);
-	if (f->unbind) {
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(c->cdev, "unbind func '%s'/%p\n", f->name, f);
-#endif
+	if (f->unbind)
 		f->unbind(c, f);
-	}
 
 	if (f->bind_deactivated)
 		usb_function_activate(f);
@@ -494,6 +490,46 @@ int usb_interface_id(struct usb_configuration *config,
 }
 EXPORT_SYMBOL_GPL(usb_interface_id);
 
+/**
+ * usb_func_wakeup - sends function wake notification to the host.
+ * @func: function that sends the remote wakeup notification.
+ *
+ * Applicable to devices operating at enhanced superspeed when usb
+ * functions are put in function suspend state and armed for function
+ * remote wakeup. On completion, function wake notification is sent. If
+ * the device is in low power state it tries to bring the device to active
+ * state before sending the wake notification. Since it is a synchronous
+ * call, caller must take care of not calling it in interrupt context.
+ * For devices operating at lower speeds  returns negative errno.
+ *
+ * Returns zero on success, else negative errno.
+ */
+int usb_func_wakeup(struct usb_function *func)
+{
+	struct usb_gadget	*gadget = func->config->cdev->gadget;
+	int			id;
+
+	if (!gadget->ops->func_wakeup)
+		return -EOPNOTSUPP;
+
+	if (!func->func_wakeup_armed) {
+		ERROR(func->config->cdev, "not armed for func remote wakeup\n");
+		return -EINVAL;
+	}
+
+	for (id = 0; id < MAX_CONFIG_INTERFACES; id++)
+		if (func->config->interface[id] == func)
+			break;
+
+	if (id == MAX_CONFIG_INTERFACES) {
+		ERROR(func->config->cdev, "Invalid function\n");
+		return -EINVAL;
+	}
+
+	return gadget->ops->func_wakeup(gadget, id);
+}
+EXPORT_SYMBOL_GPL(usb_func_wakeup);
+
 static u8 encode_bMaxPower(enum usb_device_speed speed,
 		struct usb_configuration *c)
 {
@@ -513,6 +549,19 @@ static u8 encode_bMaxPower(enum usb_device_speed speed,
 		 * by 8 the integral division will effectively cap to 896mA.
 		 */
 		return min(val, 900U) / 8;
+}
+
+void check_remote_wakeup_config(struct usb_gadget *g,
+				struct usb_configuration *c)
+{
+	if (USB_CONFIG_ATT_WAKEUP & c->bmAttributes) {
+		/* Reset the rw bit if gadget is not capable of it */
+		if (!g->wakeup_capable && g->ops->set_remote_wakeup) {
+			WARN(c->cdev, "Clearing wakeup bit for config c.%d\n",
+			     c->bConfigurationValue);
+			c->bmAttributes &= ~USB_CONFIG_ATT_WAKEUP;
+		}
+	}
 }
 
 static int config_buf(struct usb_configuration *config,
@@ -851,7 +900,7 @@ static void reset_config(struct usb_composite_dev *cdev)
 {
 	struct usb_function		*f;
 
-	INFO(cdev, "reset config\n");
+	DBG(cdev, "reset config\n");
 
 	list_for_each_entry(f, &cdev->config->functions, list) {
 		if (f->disable)
@@ -872,9 +921,6 @@ static int set_config(struct usb_composite_dev *cdev,
 	unsigned		power = gadget_is_otg(gadget) ? 8 : 100;
 	int			tmp;
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	INFO(cdev, "set config\n");
-#endif
 	if (number) {
 		list_for_each_entry(iter, &cdev->configs, list) {
 			if (iter->bConfigurationValue != number)
@@ -898,7 +944,7 @@ static int set_config(struct usb_composite_dev *cdev,
 		result = 0;
 	}
 
-	INFO(cdev, "%s config #%d: %s\n",
+	DBG(cdev, "%s config #%d: %s\n",
 	    usb_speed_string(gadget->speed),
 	    number, c ? c->label : "unconfigured");
 
@@ -966,11 +1012,17 @@ static int set_config(struct usb_composite_dev *cdev,
 		power = min(power, 500U);
 	else
 		power = min(power, 900U);
-done:
-	if (power <= USB_SELF_POWER_VBUS_MAX_DRAW)
-		usb_gadget_set_selfpowered(gadget);
+
+	if (USB_CONFIG_ATT_WAKEUP & c->bmAttributes)
+		usb_gadget_set_remote_wakeup(gadget, 1);
 	else
+		usb_gadget_set_remote_wakeup(gadget, 0);
+done:
+	if (power > USB_SELF_POWER_VBUS_MAX_DRAW ||
+	    (c && !(c->bmAttributes & USB_CONFIG_ATT_SELFPOWER)))
 		usb_gadget_clear_selfpowered(gadget);
+	else
+		usb_gadget_set_selfpowered(gadget);
 
 	usb_gadget_vbus_draw(gadget, power);
 	if (result >= 0 && cdev->delayed_status)
@@ -1027,7 +1079,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 	if (!bind)
 		goto done;
 
-	INFO(cdev, "adding config #%u '%s'/%p\n",
+	DBG(cdev, "adding config #%u '%s'/%p\n",
 			config->bConfigurationValue,
 			config->label, config);
 
@@ -1048,7 +1100,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 					struct usb_function, list);
 			list_del(&f->list);
 			if (f->unbind) {
-				INFO(cdev, "unbind function '%s'/%p\n",
+				DBG(cdev, "unbind function '%s'/%p\n",
 					f->name, f);
 				f->unbind(config, f);
 				/* may free memory for "f" */
@@ -1056,13 +1108,10 @@ int usb_add_config(struct usb_composite_dev *cdev,
 		}
 		list_del(&config->list);
 		config->cdev = NULL;
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(cdev, "bind failed for one entry only\n");
-#endif
 	} else {
 		unsigned	i;
 
-		INFO(cdev, "cfg %d/%p speeds:%s%s%s%s\n",
+		DBG(cdev, "cfg %d/%p speeds:%s%s%s%s\n",
 			config->bConfigurationValue, config,
 			config->superspeed_plus ? " superplus" : "",
 			config->superspeed ? " super" : "",
@@ -1078,7 +1127,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 
 			if (!f)
 				continue;
-			INFO(cdev, "  interface %d = %s/%p\n",
+			DBG(cdev, "  interface %d = %s/%p\n",
 				i, f->name, f);
 		}
 	}
@@ -1487,29 +1536,6 @@ int usb_string_ids_n(struct usb_composite_dev *c, unsigned n)
 }
 EXPORT_SYMBOL_GPL(usb_string_ids_n);
 
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-extern struct device *g_honor_android_gadget_dev;
-static void os_windows_uevent_fn(struct work_struct *work)
-{
-	char *os_windows[2] = { "USB_HOST_OS=WINDOWS", NULL };
-
-	if (!g_honor_android_gadget_dev) {
-		pr_info("%s g_honor_android_gadget_dev is NULL\n", __func__);
-		return;
-	}
-	pr_info("%s uevent send USB_HOST_OS=WINDOWS\n", __func__);
-	kobject_uevent_env(&g_honor_android_gadget_dev->kobj, KOBJ_CHANGE, os_windows);
-}
-static DECLARE_DELAYED_WORK(os_desc_work, os_windows_uevent_fn);
-
-static void os_windows_uevent(struct usb_composite_dev *cdev)
-{
-	if (delayed_work_pending(&os_desc_work))
-		cancel_delayed_work(&os_desc_work);
-	schedule_delayed_work(&os_desc_work, msecs_to_jiffies(100));
-}
-#endif
-
 /*-------------------------------------------------------------------------*/
 
 static void composite_setup_complete(struct usb_ep *ep, struct usb_request *req)
@@ -1535,12 +1561,9 @@ static void composite_setup_complete(struct usb_ep *ep, struct usb_request *req)
 
 	if (cdev->req == req)
 		cdev->setup_pending = false;
-	else if (cdev->os_desc_req == req) {
+	else if (cdev->os_desc_req == req)
 		cdev->os_desc_pending = false;
-#ifdef CONFIG_HONOR_DIGITAL_PAD
-		os_windows_uevent(cdev);
-#endif
-	} else
+	else
 		WARN(1, "unknown request %p\n", req);
 }
 
@@ -1832,9 +1855,10 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 				if (cdev->config)
 					config = cdev->config;
 				else
-					config = list_first_entry(
+					config = list_first_entry_or_null(
 							&cdev->configs,
-						struct usb_configuration, list);
+							struct usb_configuration,
+							list);
 				if (!config)
 					goto done;
 
@@ -1868,9 +1892,6 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 		spin_lock(&cdev->lock);
 		value = set_config(cdev, ctrl, w_value);
 		spin_unlock(&cdev->lock);
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(cdev, "USB_REQ_SET_CONFIGURATION: value=%d\n", value);
-#endif
 		break;
 	case USB_REQ_GET_CONFIGURATION:
 		if (ctrl->bRequestType != USB_DIR_IN)
@@ -1880,9 +1901,6 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 		else
 			*(u8 *)req->buf = 0;
 		value = min(w_length, (u16) 1);
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(cdev, "USB_REQ_GET_CONFIGURATION: value=%d\n", value);
-#endif
 		break;
 
 	/* function drivers must handle get/set altsetting */
@@ -1906,16 +1924,13 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 		spin_lock(&cdev->lock);
 		value = f->set_alt(f, w_index, w_value);
 		if (value == USB_GADGET_DELAYED_STATUS) {
-			INFO(cdev,
+			DBG(cdev,
 			 "%s: interface %d (%s) requested delayed status\n",
 					__func__, intf, f->name);
 			cdev->delayed_status++;
-			INFO(cdev, "delayed_status count %d\n",
+			DBG(cdev, "delayed_status count %d\n",
 					cdev->delayed_status);
 		}
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(cdev, "USB_REQ_SET_INTERFACE: value=%d\n", value);
-#endif
 		spin_unlock(&cdev->lock);
 		break;
 	case USB_REQ_GET_INTERFACE:
@@ -1932,9 +1947,6 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 			break;
 		*((u8 *)req->buf) = value;
 		value = min(w_length, (u16) 1);
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-		INFO(cdev, "USB_REQ_GET_INTERFACE: value=%d\n", value);
-#endif
 		break;
 	case USB_REQ_GET_STATUS:
 		if (gadget_is_otg(gadget) && gadget->hnp_polling_support &&
@@ -2013,9 +2025,6 @@ unknown:
 			int				interface;
 			int				count = 0;
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-			pr_info("%s OS descriptors handling\n", __func__);
-#endif
 			req = cdev->os_desc_req;
 			req->context = cdev;
 			req->complete = composite_setup_complete;
@@ -2170,9 +2179,6 @@ check_value:
 	}
 
 done:
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	pr_info("%s value %d\n", __func__, value);
-#endif
 	/* device either stalls (value < 0) or reports success */
 	return value;
 }
@@ -2196,9 +2202,6 @@ static void __composite_disconnect(struct usb_gadget *gadget)
 
 void composite_disconnect(struct usb_gadget *gadget)
 {
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	pr_info("%s\n", __func__);
-#endif
 	usb_gadget_vbus_draw(gadget, 0);
 	__composite_disconnect(gadget);
 }
@@ -2210,9 +2213,6 @@ void composite_reset(struct usb_gadget *gadget)
 	 * specification v1.2 states that a device connected on a SDP shall only
 	 * draw at max 100mA while in a connected, but unconfigured state.
 	 */
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	pr_info("%s\n", __func__);
-#endif
 	usb_gadget_vbus_draw(gadget, 100);
 	__composite_disconnect(gadget);
 }
@@ -2263,9 +2263,6 @@ static void __composite_unbind(struct usb_gadget *gadget, bool unbind_driver)
 
 static void composite_unbind(struct usb_gadget *gadget)
 {
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	pr_info("%s\n", __func__);
-#endif
 	__composite_unbind(gadget, true);
 }
 
@@ -2370,6 +2367,11 @@ int composite_os_desc_req_prepare(struct usb_composite_dev *cdev,
 	if (!cdev->os_desc_req->buf) {
 		ret = -ENOMEM;
 		usb_ep_free_request(ep0, cdev->os_desc_req);
+		/*
+		 * Set os_desc_req to NULL so that composite_dev_cleanup()
+		 * will not try to free it again.
+		 */
+		cdev->os_desc_req = NULL;
 		goto end;
 	}
 	cdev->os_desc_req->context = cdev;
@@ -2431,9 +2433,6 @@ static int composite_bind(struct usb_gadget *gadget,
 	struct usb_composite_driver	*composite = to_cdriver(gdriver);
 	int				status = -ENOMEM;
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	pr_info("%s\n", __func__);
-#endif
 	cdev = kzalloc(sizeof *cdev, GFP_KERNEL);
 	if (!cdev)
 		return status;
@@ -2486,7 +2485,7 @@ void composite_suspend(struct usb_gadget *gadget)
 	/* REVISIT:  should we have config level
 	 * suspend/resume callbacks?
 	 */
-	pr_info("%s\n", __func__);
+	DBG(cdev, "suspend\n");
 	if (cdev->config) {
 		list_for_each_entry(f, &cdev->config->functions, list) {
 			if (f->suspend)
@@ -2498,7 +2497,10 @@ void composite_suspend(struct usb_gadget *gadget)
 
 	cdev->suspended = 1;
 
-	usb_gadget_set_selfpowered(gadget);
+	if (cdev->config &&
+	    cdev->config->bmAttributes & USB_CONFIG_ATT_SELFPOWER)
+		usb_gadget_set_selfpowered(gadget);
+
 	usb_gadget_vbus_draw(gadget, 2);
 }
 
@@ -2511,7 +2513,7 @@ void composite_resume(struct usb_gadget *gadget)
 	/* REVISIT:  should we have config level
 	 * suspend/resume callbacks?
 	 */
-	pr_info("%s\n", __func__);
+	DBG(cdev, "resume\n");
 	if (cdev->driver->resume)
 		cdev->driver->resume(cdev);
 	if (cdev->config) {
@@ -2527,8 +2529,11 @@ void composite_resume(struct usb_gadget *gadget)
 		else
 			maxpower = min(maxpower, 900U);
 
-		if (maxpower > USB_SELF_POWER_VBUS_MAX_DRAW)
+		if (maxpower > USB_SELF_POWER_VBUS_MAX_DRAW ||
+		    !(cdev->config->bmAttributes & USB_CONFIG_ATT_SELFPOWER))
 			usb_gadget_clear_selfpowered(gadget);
+		else
+			usb_gadget_set_selfpowered(gadget);
 
 		usb_gadget_vbus_draw(gadget, maxpower);
 	}

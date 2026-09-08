@@ -82,11 +82,8 @@ void nl80211_send_connect_result(struct cfg80211_registered_device *rdev,
 void nl80211_send_roamed(struct cfg80211_registered_device *rdev,
 			 struct net_device *netdev,
 			 struct cfg80211_roam_info *info, gfp_t gfp);
-/* For STA/GC, indicate port authorized with AP/GO bssid.
- * For GO/AP, use peer GC/STA mac_addr.
- */
 void nl80211_send_port_authorized(struct cfg80211_registered_device *rdev,
-				  struct net_device *netdev, const u8 *peer_addr,
+				  struct net_device *netdev, const u8 *bssid,
 				  const u8 *td_bitmap, u8 td_bitmap_len);
 void nl80211_send_disconnected(struct cfg80211_registered_device *rdev,
 			       struct net_device *netdev, u16 reason,
@@ -117,7 +114,7 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
 		     enum nl80211_radar_event event,
 		     struct net_device *netdev, gfp_t gfp);
 
-void nl80211_send_ap_stopped(struct wireless_dev *wdev, unsigned int link_id);
+void nl80211_send_ap_stopped(struct wireless_dev *wdev);
 
 void cfg80211_rdev_free_coalesce(struct cfg80211_registered_device *rdev);
 

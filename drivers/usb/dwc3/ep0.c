@@ -31,34 +31,6 @@ static void __dwc3_ep0_do_control_status(struct dwc3 *dwc, struct dwc3_ep *dep);
 static void __dwc3_ep0_do_control_data(struct dwc3 *dwc,
 		struct dwc3_ep *dep, struct dwc3_request *req);
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-static void dbg_ep0_setup(u8 ep_num, const struct usb_ctrlrequest *req)
-{
-	if (req != NULL) {
-		pr_err(
-			"EP: %02X %s Ty: %02X Rq: %02X Va: %04X In: %04X Len: %d\n",
-			ep_num, "SETUP", req->bRequestType,
-			req->bRequest, le16_to_cpu(req->wValue),
-			le16_to_cpu(req->wIndex), le16_to_cpu(req->wLength));
-	}
-}
-
-static void dbg_ep0_queue(u8 ep_num, const struct usb_request *req, int status)
-{
-	if (req != NULL) {
-		pr_err(
-			"EP: %02X %s S: %i !Rn: %d Len %d\n", ep_num, "QUEUE", status,
-			!req->no_interrupt, req->length);
-	}
-}
-
-static void dbg_ep0_done(u8 ep_num, const u32 count, int status)
-{
-	pr_err("EP: %02X %s S: %i C: %d\n",
-			ep_num, "DONE", status, count);
-}
-#endif
-
 static void dwc3_ep0_prepare_one_trb(struct dwc3_ep *dep,
 		dma_addr_t buf_dma, u32 len, u32 type, bool chain)
 {
@@ -120,6 +92,7 @@ static int __dwc3_gadget_ep0_queue(struct dwc3_ep *dep,
 	req->request.actual	= 0;
 	req->request.status	= -EINPROGRESS;
 	req->epnum		= dep->number;
+	req->status		= DWC3_REQUEST_STATUS_QUEUED;
 
 	list_add_tail(&req->list, &dep->pending_list);
 
@@ -314,7 +287,9 @@ void dwc3_ep0_out_start(struct dwc3 *dwc)
 	dwc3_ep0_prepare_one_trb(dep, dwc->ep0_trb_addr, 8,
 			DWC3_TRBCTL_CONTROL_SETUP, false);
 	ret = dwc3_ep0_start_trans(dep);
-	WARN_ON(ret < 0);
+	if (ret < 0)
+		dev_err(dwc->dev, "ep0 out start transfer failed: %d\n", ret);
+
 	for (i = 2; i < DWC3_ENDPOINTS_NUM; i++) {
 		struct dwc3_ep *dwc3_ep;
 
@@ -868,9 +843,6 @@ static void dwc3_ep0_inspect_setup(struct dwc3 *dwc,
 		dwc->ep0_next_event = DWC3_EP0_NRDY_DATA;
 	}
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	dbg_ep0_setup(0x00, ctrl);
-#endif
 	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD)
 		ret = dwc3_ep0_std_request(dwc, ctrl);
 	else
@@ -977,9 +949,6 @@ static void dwc3_ep0_complete_status(struct dwc3 *dwc,
 	if (status == DWC3_TRBSTS_SETUP_PENDING)
 		dwc->setup_packet_pending = true;
 
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	dbg_ep0_done(dep->number, 0, status);
-#endif
 	dwc->ep0state = EP0_SETUP_PHASE;
 	dwc3_ep0_out_start(dwc);
 }
@@ -1092,10 +1061,9 @@ static void __dwc3_ep0_do_control_data(struct dwc3 *dwc,
 		ret = dwc3_ep0_start_trans(dep);
 	}
 
-	WARN_ON(ret < 0);
-#ifdef CONFIG_USB_HONOR_LOG_DEBUG
-	dbg_ep0_queue(dep->number, &req->request, ret);
-#endif
+	if (ret < 0)
+		dev_err(dwc->dev,
+			"ep0 data phase start transfer failed: %d\n", ret);
 }
 
 static int dwc3_ep0_start_control_status(struct dwc3_ep *dep)
@@ -1112,7 +1080,12 @@ static int dwc3_ep0_start_control_status(struct dwc3_ep *dep)
 
 static void __dwc3_ep0_do_control_status(struct dwc3 *dwc, struct dwc3_ep *dep)
 {
-	WARN_ON(dwc3_ep0_start_control_status(dep));
+	int	ret;
+
+	ret = dwc3_ep0_start_control_status(dep);
+	if (ret)
+		dev_err(dwc->dev,
+			"ep0 status phase start transfer failed: %d\n", ret);
 }
 
 static void dwc3_ep0_do_control_status(struct dwc3 *dwc,
@@ -1155,7 +1128,10 @@ void dwc3_ep0_end_control_data(struct dwc3 *dwc, struct dwc3_ep *dep)
 	cmd |= DWC3_DEPCMD_PARAM(dep->resource_index);
 	memset(&params, 0, sizeof(params));
 	ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
-	WARN_ON_ONCE(ret);
+	if (ret)
+		dev_err_ratelimited(dwc->dev,
+			"ep0 data phase end transfer failed: %d\n", ret);
+
 	dep->resource_index = 0;
 }
 

@@ -75,7 +75,7 @@ struct cfg80211_registered_device {
 	struct sk_buff *scan_msg;
 	struct list_head sched_scan_req_list;
 	time64_t suspend_at;
-	struct work_struct scan_done_wk;
+	struct wiphy_work scan_done_wk;
 
 	struct genl_info *cur_cmd_info;
 
@@ -276,7 +276,7 @@ struct cfg80211_event {
 			struct ieee80211_channel *channel;
 		} ij;
 		struct {
-			u8 peer_addr[ETH_ALEN];
+			u8 bssid[ETH_ALEN];
 			const u8 *td_bitmap;
 			u8 td_bitmap_len;
 		} pa;
@@ -295,11 +295,17 @@ struct cfg80211_beacon_registration {
 };
 
 struct cfg80211_cqm_config {
+	struct rcu_head rcu_head;
 	u32 rssi_hyst;
 	s32 last_rssi_event_value;
+	enum nl80211_cqm_rssi_threshold_event last_rssi_event_type;
+	bool use_range_api;
 	int n_rssi_thresholds;
 	s32 rssi_thresholds[];
 };
+
+void cfg80211_cqm_rssi_notify_work(struct wiphy *wiphy,
+				   struct wiphy_work *work);
 
 void cfg80211_destroy_ifaces(struct cfg80211_registered_device *rdev);
 
@@ -417,7 +423,7 @@ int cfg80211_disconnect(struct cfg80211_registered_device *rdev,
 			bool wextev);
 void __cfg80211_roamed(struct wireless_dev *wdev,
 		       struct cfg80211_roam_info *info);
-void __cfg80211_port_authorized(struct wireless_dev *wdev, const u8 *peer_addr,
+void __cfg80211_port_authorized(struct wireless_dev *wdev, const u8 *bssid,
 				const u8 *td_bitmap, u8 td_bitmap_len);
 int cfg80211_mgd_wext_connect(struct cfg80211_registered_device *rdev,
 			      struct wireless_dev *wdev);
@@ -441,7 +447,7 @@ bool cfg80211_valid_key_idx(struct cfg80211_registered_device *rdev,
 int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 				   struct key_params *params, int key_idx,
 				   bool pairwise, const u8 *mac_addr);
-void __cfg80211_scan_done(struct work_struct *wk);
+void __cfg80211_scan_done(struct wiphy *wiphy, struct wiphy_work *wk);
 void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
 			   bool send_message);
 void cfg80211_add_sched_scan_req(struct cfg80211_registered_device *rdev,
@@ -566,8 +572,6 @@ cfg80211_bss_update(struct cfg80211_registered_device *rdev,
  */
 #define CFG80211_DEV_WARN_ON(cond)	({bool __r = (cond); __r; })
 #endif
-
-void cfg80211_cqm_config_free(struct wireless_dev *wdev);
 
 void cfg80211_release_pmsr(struct wireless_dev *wdev, u32 portid);
 void cfg80211_pmsr_wdev_down(struct wireless_dev *wdev);

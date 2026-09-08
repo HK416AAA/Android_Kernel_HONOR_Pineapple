@@ -40,20 +40,11 @@
 #include <linux/uaccess.h>
 #include <linux/hugetlb.h>
 #include <linux/sched/mm.h>
-#include <linux/io.h>
 #include <asm/tlbflush.h>
 #include <asm/shmparam.h>
 
-#ifdef CONFIG_HUGEPAGE_POOL
-#include <linux/hugepage_pool.h>
-#endif
-
 #include "internal.h"
 #include "pgalloc-track.h"
-
-#ifdef CONFIG_VMALLOC_OPT_DEBUG
-static atomic64_t opt_size = ATOMIC64_INIT(0);
-#endif
 
 #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
 static unsigned int __ro_after_init ioremap_max_page_shift = BITS_PER_LONG - 1;
@@ -144,6 +135,8 @@ static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
 {
+	int ret;
+
 	if (max_page_shift < PMD_SHIFT)
 		return 0;
 
@@ -159,10 +152,31 @@ static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 	if (!IS_ALIGNED(phys_addr, PMD_SIZE))
 		return 0;
 
-	if (pmd_present(*pmd) && !pmd_free_pte_page(pmd, addr))
-		return 0;
+	if (!pmd_present(*pmd))
+		return pmd_set_huge(pmd, phys_addr, prot);
 
-	return pmd_set_huge(pmd, phys_addr, prot);
+	/*
+	 * Acquire the mmap read lock to exclude ptdump, which walks
+	 * kernel page tables it does not own under the mmap write lock.
+	 *
+	 * Concurrent read lock holders are safe: each exclusively owns
+	 * the range it operates on and cannot reach this page table.
+	 */
+#ifndef CONFIG_ARM64
+	if (!mmap_read_trylock(&init_mm))
+		return 0;
+#endif
+
+	if (!pmd_free_pte_page(pmd, addr))
+		ret = 0;
+	else
+		ret = pmd_set_huge(pmd, phys_addr, prot);
+
+#ifndef CONFIG_ARM64
+	mmap_read_unlock(&init_mm);
+#endif
+
+	return ret;
 }
 
 static int vmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
@@ -194,6 +208,8 @@ static int vmap_try_huge_pud(pud_t *pud, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
 {
+	int ret;
+
 	if (max_page_shift < PUD_SHIFT)
 		return 0;
 
@@ -209,10 +225,25 @@ static int vmap_try_huge_pud(pud_t *pud, unsigned long addr, unsigned long end,
 	if (!IS_ALIGNED(phys_addr, PUD_SIZE))
 		return 0;
 
-	if (pud_present(*pud) && !pud_free_pmd_page(pud, addr))
-		return 0;
+	if (!pud_present(*pud))
+		return pud_set_huge(pud, phys_addr, prot);
 
-	return pud_set_huge(pud, phys_addr, prot);
+	/* See comment in vmap_try_huge_pmd(). */
+#ifndef CONFIG_ARM64
+	if (!mmap_read_trylock(&init_mm))
+		return 0;
+#endif
+
+	if (!pud_free_pmd_page(pud, addr))
+		ret = 0;
+	else
+		ret = pud_set_huge(pud, phys_addr, prot);
+
+#ifndef CONFIG_ARM64
+	mmap_read_unlock(&init_mm);
+#endif
+
+	return ret;
 }
 
 static int vmap_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
@@ -245,6 +276,8 @@ static int vmap_try_huge_p4d(p4d_t *p4d, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
 {
+	int ret;
+
 	if (max_page_shift < P4D_SHIFT)
 		return 0;
 
@@ -260,10 +293,25 @@ static int vmap_try_huge_p4d(p4d_t *p4d, unsigned long addr, unsigned long end,
 	if (!IS_ALIGNED(phys_addr, P4D_SIZE))
 		return 0;
 
-	if (p4d_present(*p4d) && !p4d_free_pud_page(p4d, addr))
-		return 0;
+	if (!p4d_present(*p4d))
+		return p4d_set_huge(p4d, phys_addr, prot);
 
-	return p4d_set_huge(p4d, phys_addr, prot);
+	/* See comment in vmap_try_huge_pmd(). */
+#ifndef CONFIG_ARM64
+	if (!mmap_read_trylock(&init_mm))
+		return 0;
+#endif
+
+	if (!p4d_free_pud_page(p4d, addr))
+		ret = 0;
+	else
+		ret = p4d_set_huge(p4d, phys_addr, prot);
+
+#ifndef CONFIG_ARM64
+	mmap_read_unlock(&init_mm);
+#endif
+
+	return ret;
 }
 
 static int vmap_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
@@ -326,17 +374,12 @@ int ioremap_page_range(unsigned long addr, unsigned long end,
 {
 	int err;
 
-	prot = pgprot_nx(prot);
-	err = vmap_range_noflush(addr, end, phys_addr, prot,
+	err = vmap_range_noflush(addr, end, phys_addr, pgprot_nx(prot),
 				 ioremap_max_page_shift);
 	flush_cache_vmap(addr, end);
 	if (!err)
 		err = kmsan_ioremap_page_range(addr, end, phys_addr, prot,
 					       ioremap_max_page_shift);
-
-	if (IS_ENABLED(CONFIG_ARCH_HAS_IOREMAP_PHYS_HOOKS) && !err)
-		ioremap_phys_range_hook(phys_addr, end - addr, prot);
-
 	return err;
 }
 
@@ -365,10 +408,6 @@ static void vunmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 		next = pmd_addr_end(addr, end);
 
 		cleared = pmd_clear_huge(pmd);
-#ifdef CONFIG_ARM64
-		if (cleared)
-			__flush_tlb_kernel_pgtable(addr);
-#endif
 		if (cleared || pmd_bad(*pmd))
 			*mask |= PGTBL_PMD_MODIFIED;
 
@@ -485,6 +524,7 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 		unsigned long end, pgprot_t prot, struct page **pages, int *nr,
 		pgtbl_mod_mask *mask)
 {
+	int err = 0;
 	pte_t *pte;
 
 	/*
@@ -498,18 +538,25 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 	do {
 		struct page *page = pages[*nr];
 
-		if (WARN_ON(!pte_none(*pte)))
-			return -EBUSY;
-		if (WARN_ON(!page))
-			return -ENOMEM;
-		if (WARN_ON(!pfn_valid(page_to_pfn(page))))
-			return -EINVAL;
+		if (WARN_ON(!pte_none(*pte))) {
+			err = -EBUSY;
+			break;
+		}
+		if (WARN_ON(!page)) {
+			err = -ENOMEM;
+			break;
+		}
+		if (WARN_ON(!pfn_valid(page_to_pfn(page)))) {
+			err = -EINVAL;
+			break;
+		}
 
 		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
 		(*nr)++;
 	} while (pte++, addr += PAGE_SIZE, addr != end);
 	*mask |= PGTBL_PTE_MODIFIED;
-	return 0;
+
+	return err;
 }
 
 static int vmap_pages_pmd_range(pud_t *pud, unsigned long addr,
@@ -584,36 +631,14 @@ static int vmap_small_pages_range_noflush(unsigned long addr, unsigned long end,
 			mask |= PGTBL_PGD_MODIFIED;
 		err = vmap_pages_p4d_range(pgd, addr, next, prot, pages, &nr, &mask);
 		if (err)
-			return err;
+			break;
 	} while (pgd++, addr = next, addr != end);
 
 	if (mask & ARCH_PAGE_TABLE_SYNC_MASK)
 		arch_sync_kernel_mappings(start, end);
 
-	return 0;
+	return err;
 }
-
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-static void split_vmalloc_hugepage(struct page **pages, unsigned int nr)
-{
-	unsigned int page_shift = PAGE_SHIFT;
-	int i;
-
-	for (i = 0; i < nr; i += 1U << (page_shift - PAGE_SHIFT)) {
-		struct page *page = pages[i];
-
-		if (unlikely(compound_order(page) > 0)) {
-			struct page *head = compound_head(page);
-
-			split_page(head, compound_order(head));
-			ClearPageCompound(head);
-			page_shift = PMD_SHIFT;
-		} else {
-			page_shift = PAGE_SHIFT;
-		}
-	}
-}
-#endif
 
 /*
  * vmap_pages_range_noflush is similar to vmap_pages_range, but does not
@@ -631,25 +656,13 @@ int __vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 
 	WARN_ON(page_shift < PAGE_SHIFT);
 
-#ifndef CONFIG_HUGEPAGE_VMALLOC
 	if (!IS_ENABLED(CONFIG_HAVE_ARCH_HUGE_VMALLOC) ||
 			page_shift == PAGE_SHIFT)
-#else
-	if (!IS_ENABLED(CONFIG_HAVE_ARCH_HUGE_VMALLOC))
-#endif
 		return vmap_small_pages_range_noflush(addr, end, prot, pages);
 
 	for (i = 0; i < nr; i += 1U << (page_shift - PAGE_SHIFT)) {
 		int err;
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-		struct page *page = pages[i];
-		int order = compound_order(page);
 
-		if (PageCompound(page) && order == HUGEPAGE_ORDER && compound_nr(page) <= (nr - i))
-			page_shift = PMD_SHIFT;
-		else
-			page_shift = PAGE_SHIFT;
-#endif
 		err = vmap_range_noflush(addr, addr + (1UL << page_shift),
 					page_to_phys(pages[i]), prot,
 					page_shift);
@@ -658,10 +671,6 @@ int __vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 
 		addr += 1UL << page_shift;
 	}
-
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-	split_vmalloc_hugepage(pages, nr);
-#endif
 
 	return 0;
 }
@@ -865,7 +874,6 @@ unsigned long vmalloc_nr_pages(void)
 {
 	return atomic_long_read(&nr_vmalloc_pages);
 }
-EXPORT_SYMBOL_GPL(vmalloc_nr_pages);
 
 /* Look up the first VA which satisfies addr < va_end, NULL if none. */
 static struct vmap_area *find_vmap_area_exceed_addr(unsigned long addr)
@@ -2678,14 +2686,9 @@ static inline void set_area_direct_map(const struct vm_struct *area,
 	int i;
 
 	/* HUGE_VMALLOC passes small pages to set_direct_map */
-	for (i = 0; i < area->nr_pages; i++) {
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-		if (area->pages[i] == NULL)
-			continue;
-#endif
+	for (i = 0; i < area->nr_pages; i++)
 		if (page_address(area->pages[i]))
 			set_direct_map(area->pages[i]);
-	}
 }
 
 /* Handle removing and resetting vm mappings related to the vm_struct. */
@@ -2718,14 +2721,7 @@ static void vm_remove_mappings(struct vm_struct *area, int deallocate_pages)
 	 * the vm_unmap_aliases() flush includes the direct map.
 	 */
 	for (i = 0; i < area->nr_pages; i += 1U << page_order) {
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-		unsigned long addr;
-		if (area->pages[i] == NULL)
-			continue;
-		addr = (unsigned long)page_address(area->pages[i]);
-#else
 		unsigned long addr = (unsigned long)page_address(area->pages[i]);
-#endif
 		if (addr) {
 			unsigned long page_size;
 
@@ -2769,26 +2765,14 @@ static void __vunmap(const void *addr, int deallocate_pages)
 
 	kasan_poison_vmalloc(area->addr, get_vm_area_size(area));
 
-	if (IS_ENABLED(CONFIG_ARCH_HAS_IOREMAP_PHYS_HOOKS) &&
-	    area->flags & VM_IOREMAP)
-		iounmap_phys_range_hook(area->phys_addr, get_vm_area_size(area));
-
 	vm_remove_mappings(area, deallocate_pages);
 
 	if (deallocate_pages) {
 		int i;
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-		int nr_allocated = 0;
-#endif
 
 		for (i = 0; i < area->nr_pages; i++) {
 			struct page *page = area->pages[i];
 
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-			if (page == NULL)
-				continue;
-			nr_allocated += 1U;
-#endif
 			BUG_ON(!page);
 			if (!(area->flags & VM_MAP_PUT_PAGES))
 				mod_memcg_page_state(page, MEMCG_VMALLOC, -1);
@@ -2799,13 +2783,8 @@ static void __vunmap(const void *addr, int deallocate_pages)
 			__free_pages(page, 0);
 			cond_resched();
 		}
-		if (!(area->flags & VM_MAP_PUT_PAGES)) {
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-		atomic_long_sub(nr_allocated, &nr_vmalloc_pages);
-#else
-		atomic_long_sub(area->nr_pages, &nr_vmalloc_pages);
-#endif
-        }
+		if (!(area->flags & VM_MAP_PUT_PAGES))
+			atomic_long_sub(area->nr_pages, &nr_vmalloc_pages);
 
 		kvfree(area->pages);
 	}
@@ -2881,121 +2860,9 @@ void vfree(const void *addr)
 	if (!addr)
 		return;
 
-#ifdef CONFIG_VMALLOC_OPT
-	if (is_vmalloc_or_module_addr(addr)) {
-		__vfree(addr);
-	} else {
-#ifdef CONFIG_VMALLOC_OPT_DEBUG
-		atomic64_sub(PAGE_SIZE - ksize(addr), &opt_size);
-#endif
-		kfree(addr);
-	}
-#else
 	__vfree(addr);
-#endif
 }
 EXPORT_SYMBOL(vfree);
-
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-unsigned int __vm_area_get_allcated_pages(const struct vm_struct *area)
-{
-	int nr_allocated = 0;
-	int i;
-
-	for (i = 0; i < area->nr_pages; i++) {
-		if (area->pages[i] != NULL)
-			nr_allocated++;
-	}
-
-	return nr_allocated;
-}
-
-static void *__vm_area_get_valid_addr(struct vm_struct *area)
-{
-	void *addr = NULL;
-	int i;
-
-	BUG_ON(area == NULL);
-	for (i = 0; i < area->nr_pages; i++) {
-		struct page *page = area->pages[i];
-		if (page != NULL) {
-			addr = area->addr + (i * PAGE_SIZE);
-			break;
-		}
-	}
-	BUG_ON(i >= area->nr_pages);
-
-	return addr;
-}
-
-void vfree_vm_area(struct vm_struct *area)
-{
-	vfree(__vm_area_get_valid_addr(area));
-}
-
-void vfree_vm_area_atomic(struct vm_struct *area)
-{
-	vfree_atomic(__vm_area_get_valid_addr(area));
-}
-
-static int map_kernel_page_atomic(unsigned long addr,
-			pgprot_t prot, struct page *page)
-{
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-
-	pgd = pgd_offset_k(addr);
-	if (pgd == NULL || pgd_none(*pgd))
-		return -EFAULT;
-
-	p4d = p4d_offset(pgd, addr);
-	if (p4d == NULL || p4d_none(*p4d))
-		return -EFAULT;
-
-	pud = pud_offset(p4d, addr);
-	if (pud == NULL || pud_none(*pud))
-		return -EFAULT;
-
-	pmd = pmd_offset(pud, addr);
-	if (pmd == NULL || pmd_none(*pmd))
-		return -EFAULT;
-
-	pte = pte_offset_kernel(pmd, addr);
-	set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
-	return 0;
-}
-
-int vmalloc_map_page_atomic(struct vm_struct *area,
-			unsigned int index, struct page *page)
-{
-	unsigned long base = (unsigned long)area->addr;
-	unsigned long page_addr;
-	int ret;
-
-	pr_devel("vmalloc_map_page_atomic page[%d]@0x%lx\n",
-			 index, base);
-	if (index >= area->nr_pages) {
-		return -EINVAL;
-	}
-
-	if (area->pages[index] != NULL) {
-		return -EEXIST;
-	}
-
-	page_addr = base + (index << PAGE_SHIFT);
-	ret = map_kernel_page_atomic(page_addr, PAGE_KERNEL, page);
-	if (ret < 0) {
-		return ret;
-	}
-	flush_cache_vmap(page_addr, page_addr + PAGE_SIZE);
-	atomic_long_inc(&nr_vmalloc_pages);
-	area->pages[index] = page;
-	return 0;
-}
-#endif
 
 /**
  * vunmap - release virtual mapping obtained by vmap()
@@ -3188,28 +3055,13 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 		if (!nofail && fatal_signal_pending(current))
 			break;
 
-		if (nid == NUMA_NO_NODE) {
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-			if(unlikely((!(gfp & __GFP_NOFAIL)) &&
-				((nr_pages - nr_allocated) >= HPAGE_PMD_NR))) {
-				order = HUGEPAGE_ORDER;
-				page = alloc_hugepage(order, HPAGE_VMALLOC);
-				if (!page) {
-					order = 0;
-					page = alloc_pages(alloc_gfp, order);
-				}
-			} else {
-				order = 0;
-				page = alloc_pages(alloc_gfp, order);
-			}
-#else
+		if (nid == NUMA_NO_NODE)
 			page = alloc_pages(alloc_gfp, order);
-#endif
-		} else {
+		else
 			page = alloc_pages_node(nid, alloc_gfp, order);
-		}
 		if (unlikely(!page))
 			break;
+
 		/*
 		 * Higher order allocations must be able to be treated as
 		 * indepdenent small pages by callers (as they can with
@@ -3217,10 +3069,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 		 * on vmalloc_to_page() pages, some use page->mapping,
 		 * page->lru, etc.
 		 */
-#ifndef CONFIG_HUGEPAGE_VMALLOC
 		if (order)
 			split_page(page, order);
-#endif
+
 		/*
 		 * Careful, we allocate and map page-order pages, but
 		 * tracking is done per PAGE_SIZE page so as to keep the
@@ -3236,16 +3087,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 	return nr_allocated;
 }
 
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-static void *__vmalloc_area_init_range(struct vm_struct *area,
-				unsigned int init_page_begin, unsigned int init_page_end,
-				gfp_t gfp_mask, pgprot_t prot, unsigned int page_shift,
-				int node)
-#else
 static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 				 pgprot_t prot, unsigned int page_shift,
 				 int node)
-#endif
 {
 	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
 	bool nofail = gfp_mask & __GFP_NOFAIL;
@@ -3281,7 +3125,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 	set_vm_area_page_order(area, page_shift - PAGE_SHIFT);
 	page_order = vm_area_page_order(area);
 
-#ifndef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
 	area->nr_pages = vm_area_alloc_pages(gfp_mask | __GFP_NOWARN,
 		node, page_order, nr_small_pages, area->pages);
 
@@ -3305,33 +3148,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 				area->nr_pages * PAGE_SIZE, page_order);
 		goto fail;
 	}
-#else
-	area->nr_pages = nr_small_pages;
-	nr_small_pages = init_page_end - init_page_begin;
-	nr_small_pages = vm_area_alloc_pages(gfp_mask | __GFP_NOWARN,
-		node, page_order, nr_small_pages, &area->pages[init_page_begin]);
-
-	atomic_long_add(nr_small_pages, &nr_vmalloc_pages);
-	if (gfp_mask & __GFP_ACCOUNT) {
-		int i;
-
-		for (i = init_page_begin; i < init_page_begin + nr_small_pages; i++)
-			mod_memcg_page_state(area->pages[i], MEMCG_VMALLOC, 1);
-	}
-
-	/*
-	 * If not enough pages were obtained to accomplish an
-	 * allocation request, free them via __vfree() if any.
-	 */
-	if (init_page_end - init_page_begin != nr_small_pages) {
-		/* vm_area_alloc_pages() can also fail due to a fatal signal */
-		if (!fatal_signal_pending(current))
-			warn_alloc(gfp_mask, NULL,
-				"vmalloc error: size %lu, page order %u, failed to allocate pages",
-				area->nr_pages * PAGE_SIZE, page_order);
-		goto fail;
-	}
-#endif
 
 	/*
 	 * page tables allocations ignore external gfp mask, enforce it
@@ -3343,15 +3159,8 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 		flags = memalloc_noio_save();
 
 	do {
-#ifndef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
 		ret = vmap_pages_range(addr, addr + size, prot, area->pages,
 			page_shift);
-#else
-		ret = vmap_pages_range(addr + init_page_begin * PAGE_SIZE,
-			addr + init_page_end * PAGE_SIZE,
-			prot, &area->pages[init_page_begin],
-			page_shift);
-#endif
 		if (nofail && (ret < 0))
 			schedule_timeout_uninterruptible(1);
 	} while (nofail && (ret < 0));
@@ -3407,21 +3216,6 @@ void *__vmalloc_node_range(unsigned long size, unsigned long align,
 			unsigned long start, unsigned long end, gfp_t gfp_mask,
 			pgprot_t prot, unsigned long vm_flags, int node,
 			const void *caller)
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-{
-	unsigned long vm_nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
-	return __vmalloc_init_range(size, align, 0, vm_nr_pages,
-				0, vm_nr_pages,
-				start, end, gfp_mask, prot, vm_flags, node, caller);
-}
-
-void *__vmalloc_init_range(unsigned long size, unsigned long align,
-			unsigned int vm_begin_page, unsigned int vm_nr_pages,
-			unsigned int init_page_begin, unsigned int init_page_end,
-			unsigned long start, unsigned long end, gfp_t gfp_mask,
-			pgprot_t prot, unsigned long vm_flags, int node,
-			const void *caller)
-#endif
 {
 	struct vm_struct *area;
 	void *ret;
@@ -3453,44 +3247,14 @@ void *__vmalloc_init_range(unsigned long size, unsigned long align,
 		size_per_node = size;
 		if (node == NUMA_NO_NODE)
 			size_per_node /= num_online_nodes();
-#ifndef CONFIG_HUGEPAGE_VMALLOC
 		if (arch_vmap_pmd_supported(prot) && size_per_node >= PMD_SIZE)
-#else
-		if (arch_vmap_pmd_supported(prot) && ((size_per_node & ~HPAGE_PMD_MASK) == 0))
-#endif
 			shift = PMD_SHIFT;
 		else
 			shift = arch_vmap_pte_supported_shift(size_per_node);
 
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-		if ( size_per_node >= PMD_SIZE)
-			align = max(real_align, 1UL << PMD_SHIFT);
-		else
-			align = max(real_align, 1UL << shift);
-#else
 		align = max(real_align, 1UL << shift);
-#endif
 		size = ALIGN(real_size, 1UL << shift);
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-		vm_nr_pages = size / PAGE_SIZE;
-		init_page_end = size / PAGE_SIZE;
-#endif
 	}
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-	size = PAGE_ALIGN(size);
-	if (vm_begin_page + vm_nr_pages > size / PAGE_SIZE ||
-		vm_nr_pages == 0 ||
-		(shift > PAGE_SHIFT && (vm_begin_page > 0 ||
-						init_page_begin > 0 ||
-						vm_nr_pages != size / PAGE_SIZE ||
-						vm_nr_pages != init_page_end)) ||
-		init_page_end > vm_nr_pages ||
-		init_page_begin >= init_page_end) {
-		warn_alloc(gfp_mask, NULL,
-			"vmalloc error: size %lu, invalid args", real_size);
-		return NULL;
-	}
-#endif
 
 again:
 	area = __get_vm_area_node(real_size, align, shift, VM_ALLOC |
@@ -3532,24 +3296,8 @@ again:
 		kasan_flags |= KASAN_VMALLOC_PROT_NORMAL;
 	}
 
-#ifdef CONFIG_HUGEPAGE_VMALLOC
-	//using __GFP_NOFAIL flag marks that vmalloc does not allocate 2MB hugepage memory
-	if (vmap_allow_huge && !(vm_flags & VM_ALLOW_HUGE_VMAP))
-		gfp_mask |= __GFP_NOFAIL;
-#endif
 	/* Allocate physical pages and map them into vmalloc space. */
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-	if (vm_begin_page > 0 || init_page_begin > 0) {
-		area->addr += vm_begin_page * PAGE_SIZE;
-		area->size = vm_nr_pages * PAGE_SIZE + (area->size - size);
-	} else {
-		init_page_end = get_vm_area_size(area) / PAGE_SIZE;
-	}
-	ret = __vmalloc_area_init_range(area, init_page_begin, init_page_end,
-					gfp_mask, prot, shift, node);
-#else
 	ret = __vmalloc_area_node(area, gfp_mask, prot, shift, node);
-#endif
 	if (!ret)
 		goto fail;
 
@@ -3614,17 +3362,6 @@ fail:
 void *__vmalloc_node(unsigned long size, unsigned long align,
 			    gfp_t gfp_mask, int node, const void *caller)
 {
-#ifdef CONFIG_VMALLOC_OPT
-	if (unlikely(size < PAGE_SIZE)) {
-		void *addr = kmalloc(size, gfp_mask);
-#ifdef CONFIG_VMALLOC_OPT_DEBUG
-		if (addr)
-			atomic64_add(PAGE_SIZE - ksize(addr), &opt_size);
-#endif
-
-		return addr;
-	}
-#endif
 	return __vmalloc_node_range(size, align, VMALLOC_START, VMALLOC_END,
 				gfp_mask, PAGE_KERNEL, 0, node, caller);
 }
@@ -3993,7 +3730,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 		size -= PAGE_SIZE;
 	} while (size > 0);
 
-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 
 	return 0;
 }
@@ -4280,9 +4017,7 @@ retry:
 	 * With hardware tag-based KASAN, marking is skipped for
 	 * non-VM_ALLOC mappings, see __kasan_unpoison_vmalloc().
 	 */
-	for (area = 0; area < nr_vms; area++)
-		vms[area]->addr = kasan_unpoison_vmalloc(vms[area]->addr,
-				vms[area]->size, KASAN_VMALLOC_PROT_NORMAL);
+	kasan_unpoison_vmap_areas(vms, nr_vms, KASAN_VMALLOC_PROT_NORMAL);
 
 	kfree(vas);
 	return vms;
@@ -4451,13 +4186,8 @@ static void show_numa_info(struct seq_file *m, struct vm_struct *v)
 
 		memset(counters, 0, nr_node_ids * sizeof(unsigned int));
 
-		for (nr = 0; nr < v->nr_pages; nr += step) {
-#ifdef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
-			if (v->pages[nr] == NULL)
-				continue;
-#endif
+		for (nr = 0; nr < v->nr_pages; nr += step)
 			counters[page_to_nid(v->pages[nr])] += step;
-		}
 		for_each_node_state(nr, N_HIGH_MEMORY)
 			if (counters[nr])
 				seq_printf(m, " N%u=%u", nr, counters[nr]);
@@ -4505,11 +4235,7 @@ static int s_show(struct seq_file *m, void *p)
 		seq_printf(m, " %pS", v->caller);
 
 	if (v->nr_pages)
-#ifndef CONFIG_VMAP_ALLOC_PAGE_ON_DEMAND
 		seq_printf(m, " pages=%d", v->nr_pages);
-#else
-		seq_printf(m, " pages=%d", __vm_area_get_allcated_pages(v));
-#endif
 
 	if (v->phys_addr)
 		seq_printf(m, " phys=%pa", &v->phys_addr);
@@ -4552,14 +4278,6 @@ static const struct seq_operations vmalloc_op = {
 	.show = s_show,
 };
 
-#ifdef CONFIG_VMALLOC_OPT_DEBUG
-static int vmalloc_opt_proc_show(struct seq_file *m, void *v)
-{
-	seq_printf(m, "opt_size:	%8llu kB\n", atomic64_read(&opt_size) / SZ_1K);
-	return 0;
-}
-#endif
-
 static int __init proc_vmalloc_init(void)
 {
 	if (IS_ENABLED(CONFIG_NUMA))
@@ -4568,10 +4286,6 @@ static int __init proc_vmalloc_init(void)
 				nr_node_ids * sizeof(unsigned int), NULL);
 	else
 		proc_create_seq("vmallocinfo", 0400, NULL, &vmalloc_op);
-
-#ifdef CONFIG_VMALLOC_OPT_DEBUG
-	proc_create_single("vmalloc_opt_size", 0, NULL, vmalloc_opt_proc_show);
-#endif
 	return 0;
 }
 module_init(proc_vmalloc_init);

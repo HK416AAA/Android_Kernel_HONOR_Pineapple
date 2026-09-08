@@ -330,8 +330,7 @@ static int recover_inode(struct inode *inode, struct page *page)
 	F2FS_I(inode)->i_advise = raw->i_advise;
 	F2FS_I(inode)->i_flags = le32_to_cpu(raw->i_flags);
 	f2fs_set_inode_flags(inode);
-	F2FS_I(inode)->i_gc_failures[GC_FAILURE_PIN] =
-				le16_to_cpu(raw->i_gc_failures);
+	F2FS_I(inode)->i_gc_failures = le16_to_cpu(raw->i_gc_failures);
 
 	recover_inline_flags(inode, raw);
 
@@ -361,7 +360,7 @@ static unsigned int adjust_por_ra_blocks(struct f2fs_sb_info *sbi,
 }
 
 static int find_fsync_dnodes(struct f2fs_sb_info *sbi, struct list_head *head,
-				bool check_only)
+				bool check_only, bool *new_inode)
 {
 	struct curseg_info *curseg;
 	struct page *page = NULL;
@@ -419,6 +418,8 @@ static int find_fsync_dnodes(struct f2fs_sb_info *sbi, struct list_head *head,
 			if (IS_ERR(entry)) {
 				err = PTR_ERR(entry);
 				if (err == -ENOENT) {
+					if (check_only)
+						*new_inode = true;
 					err = 0;
 					goto next;
 				}
@@ -835,9 +836,20 @@ int f2fs_recover_fsync_data(struct f2fs_sb_info *sbi, bool check_only)
 	unsigned long s_flags = sbi->sb->s_flags;
 	bool need_writecp = false;
 	bool fix_curseg_write_pointer = false;
+	bool new_inode = false;
+#ifdef CONFIG_QUOTA
+	int quota_enabled;
+#endif
 
-	if (is_sbi_flag_set(sbi, SBI_IS_WRITABLE))
+	if (s_flags & SB_RDONLY) {
 		f2fs_info(sbi, "recover fsync data on readonly fs");
+		sbi->sb->s_flags &= ~SB_RDONLY;
+	}
+
+#ifdef CONFIG_QUOTA
+	/* Turn on quotas so that they are updated correctly */
+	quota_enabled = f2fs_enable_quota_files(sbi, s_flags & SB_RDONLY);
+#endif
 
 	INIT_LIST_HEAD(&inode_list);
 	INIT_LIST_HEAD(&tmp_inode_list);
@@ -847,8 +859,8 @@ int f2fs_recover_fsync_data(struct f2fs_sb_info *sbi, bool check_only)
 	f2fs_down_write(&sbi->cp_global_sem);
 
 	/* step #1: find fsynced inode numbers */
-	err = find_fsync_dnodes(sbi, &inode_list, check_only);
-	if (err || list_empty(&inode_list))
+	err = find_fsync_dnodes(sbi, &inode_list, check_only, &new_inode);
+	if (err < 0 || (list_empty(&inode_list) && (!check_only || !new_inode)))
 		goto skip;
 
 	if (check_only) {
@@ -911,6 +923,11 @@ skip:
 		}
 	}
 
+#ifdef CONFIG_QUOTA
+	/* Turn quotas off */
+	if (quota_enabled)
+		f2fs_quota_off_umount(sbi->sb);
+#endif
 	sbi->sb->s_flags = s_flags; /* Restore SB_RDONLY status */
 
 	return ret ? ret : err;
@@ -920,7 +937,9 @@ int __init f2fs_create_recovery_cache(void)
 {
 	fsync_entry_slab = f2fs_kmem_cache_create("f2fs_fsync_inode_entry",
 					sizeof(struct fsync_inode_entry));
-	return fsync_entry_slab ? 0 : -ENOMEM;
+	if (!fsync_entry_slab)
+		return -ENOMEM;
+	return 0;
 }
 
 void f2fs_destroy_recovery_cache(void)

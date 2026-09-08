@@ -77,7 +77,7 @@
  * A single 'zspage' is composed of up to 2^N discontiguous 0-order (single)
  * pages. ZS_MAX_ZSPAGE_ORDER defines upper limit on N.
  */
-#define ZS_MAX_ZSPAGE_ORDER 3
+#define ZS_MAX_ZSPAGE_ORDER 2
 #define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)
 
 #define ZS_HANDLE_SIZE (sizeof(unsigned long))
@@ -120,10 +120,9 @@
 #define HUGE_BITS	1
 #define FULLNESS_BITS	2
 #define CLASS_BITS	8
-#define ISOLATED_BITS	(ZS_MAX_ZSPAGE_ORDER + 1)
+#define ISOLATED_BITS	3
 #define MAGIC_VAL_BITS	8
 
-#define MAX(a, b) ((a) >= (b) ? (a) : (b))
 /* ZS_MIN_ALLOC_SIZE must be multiple of ZS_ALIGN */
 #define ZS_MIN_ALLOC_SIZE \
 	MAX(32, (ZS_MAX_PAGES_PER_ZSPAGE << PAGE_SHIFT >> OBJ_INDEX_BITS))
@@ -205,13 +204,6 @@ struct size_class {
 	struct zs_size_stat stats;
 };
 
-#ifdef CONFIG_ZS_MALLOC_EXT
-struct size_class_ext {
-	struct size_class *class;
-	void *priv;
-};
-#endif
-
 /*
  * Placed within free objects to form a singly linked list.
  * For every zspage, zspage->freeobj gives head of this list.
@@ -244,11 +236,7 @@ struct zs_pool {
 	struct zs_pool_stats stats;
 
 	/* Compact classes */
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	struct shrinker *shrinker;
-#else
 	struct shrinker shrinker;
-#endif
 
 #ifdef CONFIG_ZSMALLOC_STAT
 	struct dentry *stat_dentry;
@@ -257,11 +245,6 @@ struct zs_pool {
 	struct work_struct free_work;
 #endif
 	spinlock_t lock;
-#ifdef CONFIG_ZS_MALLOC_EXT
-	int ext_flag;
-	ext_size_parse_fn *size_parse;
-	ext_zsmalloc_fn *ext_zsmalloc;
-#endif
 	atomic_t compaction_in_progress;
 };
 
@@ -350,7 +333,7 @@ static void destroy_cache(struct zs_pool *pool)
 static unsigned long cache_alloc_handle(struct zs_pool *pool, gfp_t gfp)
 {
 	return (unsigned long)kmem_cache_alloc(pool->handle_cachep,
-			gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE|__GFP_CMA));
+			gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE));
 }
 
 static void cache_free_handle(struct zs_pool *pool, unsigned long handle)
@@ -361,7 +344,7 @@ static void cache_free_handle(struct zs_pool *pool, unsigned long handle)
 static struct zspage *cache_alloc_zspage(struct zs_pool *pool, gfp_t flags)
 {
 	return kmem_cache_zalloc(pool->zspage_cachep,
-			flags & ~(__GFP_HIGHMEM|__GFP_MOVABLE|__GFP_CMA));
+			flags & ~(__GFP_HIGHMEM|__GFP_MOVABLE));
 }
 
 static void cache_free_zspage(struct zs_pool *pool, struct zspage *zspage)
@@ -1054,36 +1037,27 @@ static void create_page_chain(struct size_class *class, struct zspage *zspage,
 /*
  * Allocate a zspage for the given size class
  */
-static struct zspage *alloc_zspage_internal(struct zs_pool *pool,
+static struct zspage *alloc_zspage(struct zs_pool *pool,
 					struct size_class *class,
-					gfp_t gfp,
-					int ext_flag)
+					gfp_t gfp)
 {
 	int i;
 	struct page *pages[ZS_MAX_PAGES_PER_ZSPAGE];
 	struct zspage *zspage = cache_alloc_zspage(pool, gfp);
-#ifdef CONFIG_ZS_MALLOC_EXT
-	struct size_class_ext *ext = NULL;
 
-	if (ext_flag) {
-		ext = (struct size_class_ext *)class;
-		class = ext->class;
-	}
-#endif
 	if (!zspage)
 		return NULL;
+
+	if (!IS_ENABLED(CONFIG_COMPACTION))
+		gfp &= ~__GFP_MOVABLE;
 
 	zspage->magic = ZSPAGE_MAGIC;
 	migrate_lock_init(zspage);
 
 	for (i = 0; i < class->pages_per_zspage; i++) {
 		struct page *page;
-#ifdef CONFIG_ZS_MALLOC_EXT
-		page = ext_flag ? pool->ext_zsmalloc(ext->priv, gfp)
-						: alloc_page(gfp);
-#else
+
 		page = alloc_page(gfp);
-#endif
 		if (!page) {
 			while (--i >= 0) {
 				dec_zone_page_state(pages[i], NR_ZSPAGES);
@@ -1103,24 +1077,6 @@ static struct zspage *alloc_zspage_internal(struct zs_pool *pool,
 
 	return zspage;
 }
-
-#ifdef CONFIG_ZS_MALLOC_EXT
-static struct zspage *alloc_zspage_ext(struct zs_pool *pool,
-					struct size_class *class,
-					gfp_t gfp,
-					int ext_flag)
-{
-	return alloc_zspage_internal(pool, class, gfp, ext_flag);
-}
-#else
-
-static struct zspage *alloc_zspage(struct zs_pool *pool,
-					struct size_class *class,
-					gfp_t gfp)
-{
-	return alloc_zspage_internal(pool, class, gfp, 0);
-}
-#endif
 
 static struct zspage *find_get_zspage(struct size_class *class)
 {
@@ -1428,20 +1384,22 @@ static unsigned long obj_malloc(struct zs_pool *pool,
 }
 
 
-unsigned long zs_malloc_internal(struct zs_pool *pool, size_t size, gfp_t gfp, int ext_flag)
+/**
+ * zs_malloc - Allocate block of given size from pool.
+ * @pool: pool to allocate from
+ * @size: size of block to allocate
+ * @gfp: gfp flags when allocating object
+ *
+ * On success, handle to the allocated object is returned,
+ * otherwise an ERR_PTR().
+ * Allocation requests with size > ZS_MAX_ALLOC_SIZE will fail.
+ */
+unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
 {
 	unsigned long handle, obj;
 	struct size_class *class;
 	enum fullness_group newfg;
 	struct zspage *zspage;
-#ifdef CONFIG_ZS_MALLOC_EXT
-	struct size_class_ext ext;
-
-	if (ext_flag) {
-		ext.priv = (void *)(uintptr_t)size;
-		size = pool->size_parse(ext.priv);
-	}
-#endif
 
 	if (unlikely(!size || size > ZS_MAX_ALLOC_SIZE))
 		return (unsigned long)ERR_PTR(-EINVAL);
@@ -1470,16 +1428,7 @@ unsigned long zs_malloc_internal(struct zs_pool *pool, size_t size, gfp_t gfp, i
 
 	spin_unlock(&pool->lock);
 
-#ifdef CONFIG_ZS_MALLOC_EXT
-	if (ext_flag) {
-		ext.class = class;
-		zspage = alloc_zspage_ext(pool, (struct size_class *)&ext, gfp, ext_flag);
-	} else {
-		zspage = alloc_zspage_ext(pool, class, gfp, ext_flag);
-	}
-#else
 	zspage = alloc_zspage(pool, class, gfp);
-#endif
 	if (!zspage) {
 		cache_free_handle(pool, handle);
 		return (unsigned long)ERR_PTR(-ENOMEM);
@@ -1501,33 +1450,6 @@ unsigned long zs_malloc_internal(struct zs_pool *pool, size_t size, gfp_t gfp, i
 	spin_unlock(&pool->lock);
 
 	return handle;
-}
-
-#ifdef CONFIG_ZS_MALLOC_EXT
-unsigned long zs_malloc_ext(struct zs_pool *pool, size_t size, gfp_t gfp, int ext_flag)
-{
-	return zs_malloc_internal(pool, size, gfp, ext_flag);
-}
-EXPORT_SYMBOL_GPL(zs_malloc_ext);
-#endif
-
-/**
- * zs_malloc - Allocate block of given size from pool.
- * @pool: pool to allocate from
- * @size: size of block to allocate
- * @gfp: gfp flags when allocating object
- *
- * On success, handle to the allocated object is returned,
- * otherwise 0.
- * Allocation requests with size > ZS_MAX_ALLOC_SIZE will fail.
- */
-unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
-{
-#ifdef CONFIG_ZS_MALLOC_EXT
-	return zs_malloc_internal(pool, size, gfp, pool->ext_flag);
-#else
-	return zs_malloc_internal(pool, size, gfp, 0);
-#endif
 }
 EXPORT_SYMBOL_GPL(zs_malloc);
 
@@ -2213,12 +2135,8 @@ static unsigned long zs_shrinker_scan(struct shrinker *shrinker,
 		struct shrink_control *sc)
 {
 	unsigned long pages_freed;
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	struct zs_pool *pool = shrinker->private_data;
-#else
 	struct zs_pool *pool = container_of(shrinker, struct zs_pool,
 			shrinker);
-#endif
 
 	/*
 	 * Compact classes and calculate compaction delta.
@@ -2236,12 +2154,8 @@ static unsigned long zs_shrinker_count(struct shrinker *shrinker,
 	int i;
 	struct size_class *class;
 	unsigned long pages_to_free = 0;
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	struct zs_pool *pool = shrinker->private_data;
-#else
 	struct zs_pool *pool = container_of(shrinker, struct zs_pool,
 			shrinker);
-#endif
 
 	for (i = ZS_SIZE_CLASSES - 1; i >= 0; i--) {
 		class = pool->size_class[i];
@@ -2256,29 +2170,11 @@ static unsigned long zs_shrinker_count(struct shrinker *shrinker,
 
 static void zs_unregister_shrinker(struct zs_pool *pool)
 {
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	shrinker_free(pool->shrinker);
-#else
 	unregister_shrinker(&pool->shrinker);
-#endif
 }
 
 static int zs_register_shrinker(struct zs_pool *pool)
 {
-#ifdef CONFIG_SHRINKER_LOCKLESS_OPT
-	pool->shrinker = shrinker_alloc(0, "mm-zspool");
-	if (!pool->shrinker)
-		return -ENOMEM;
-
-	pool->shrinker->scan_objects = zs_shrinker_scan;
-	pool->shrinker->count_objects = zs_shrinker_count;
-	pool->shrinker->batch = 0;
-	pool->shrinker->private_data = pool;
-
-	shrinker_register(pool->shrinker);
-
-	return 0;
-#else
 	pool->shrinker.scan_objects = zs_shrinker_scan;
 	pool->shrinker.count_objects = zs_shrinker_count;
 	pool->shrinker.batch = 0;
@@ -2286,7 +2182,6 @@ static int zs_register_shrinker(struct zs_pool *pool)
 
 	return register_shrinker(&pool->shrinker, "mm-zspool:%s",
 				 pool->name);
-#endif
 }
 
 /**
@@ -2441,25 +2336,6 @@ void zs_destroy_pool(struct zs_pool *pool)
 	kfree(pool);
 }
 EXPORT_SYMBOL_GPL(zs_destroy_pool);
-
-#ifdef CONFIG_ZS_MALLOC_EXT
-bool is_ext_pool(struct zs_pool *pool)
-{
-	return pool->ext_flag;
-}
-void zs_pool_enable_ext(struct zs_pool *pool, bool enable,
-					ext_size_parse_fn *parse_fn)
-{
-	pool->ext_flag = enable ? 1 : 0;
-	pool->size_parse = enable ? parse_fn : NULL;
-}
-
-void zs_pool_ext_malloc_register(struct zs_pool *pool,
-						ext_zsmalloc_fn *fn)
-{
-	pool->ext_zsmalloc = fn;
-}
-#endif
 
 static int __init zs_init(void)
 {

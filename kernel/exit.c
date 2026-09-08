@@ -65,9 +65,6 @@
 #include <linux/rcuwait.h>
 #include <linux/compat.h>
 #include <linux/io_uring.h>
-#ifdef CONFIG_XRECLAIMER
-#include <linux/xreclaimer.h>
-#endif
 #include <linux/kprobes.h>
 #include <linux/rethook.h>
 #include <linux/sysfs.h>
@@ -75,12 +72,6 @@
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/mmu_context.h>
-#include <trace/hooks/mm.h>
-#include <trace/hooks/dtask.h>
-
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-#include <linux/rainbow_reason.h>
-#endif
 
 /*
  * The default value should be high enough to not crash a system that randomly
@@ -212,7 +203,13 @@ static void __exit_signal(struct task_struct *tsk)
 	 * doing sigqueue_free() if we have SIGQUEUE_PREALLOC signals.
 	 */
 	flush_sigqueue(&tsk->pending);
-	tsk->sighand = NULL;
+
+	/*
+	 * Ensure that all preceeding state is visible. Pairs with
+	 * the smp_acquire__after_ctrl_dep() in the sighand == NULL
+	 * path of lock_task_sighand().
+	 */
+	smp_store_release(&tsk->sighand, NULL);
 	spin_unlock(&sighand->siglock);
 
 	__cleanup_sighand(sighand);
@@ -564,17 +561,14 @@ static void exit_mm(void)
 	 */
 	smp_mb__after_spinlock();
 	local_irq_disable();
+	current->user_dumpable = (get_dumpable(mm) == SUID_DUMP_USER);
 	current->mm = NULL;
 	membarrier_update_current_mm(NULL);
 	enter_lazy_tlb(mm, current);
 	local_irq_enable();
 	task_unlock(current);
 	mmap_read_unlock(mm);
-#ifdef CONFIG_XRECLAIMER
-	xreclaimer_dec_mm_tasks(mm);
-#endif
 	mm_update_next_owner(mm);
-	trace_android_vh_exit_mm(mm);
 	mmput(mm);
 	if (test_thread_flag(TIF_MEMDIE))
 		exit_oom_victim();
@@ -828,7 +822,6 @@ void __noreturn do_exit(long code)
 
 	WARN_ON(tsk->plug);
 
-	profile_task_exit(tsk);
 	kcov_task_exit(tsk);
 	kmsan_task_exit(tsk);
 
@@ -840,8 +833,6 @@ void __noreturn do_exit(long code)
 	io_uring_files_cancel();
 	exit_signals(tsk);  /* sets PF_EXITING */
 
-	trace_android_vh_exit_check(current);
-
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)
 		sync_mm_rss(tsk->mm);
@@ -852,13 +843,9 @@ void __noreturn do_exit(long code)
 		 * If the last thread of global init has exited, panic
 		 * immediately to get a useable coredump.
 		 */
-		if (unlikely(is_global_init(tsk))) {
-#if (IS_BUILTIN(CONFIG_RAINBOW) && IS_ENABLED(CONFIG_RAINBOW_REASON))
-			rb_sreason_set("kill_init");
-#endif
+		if (unlikely(is_global_init(tsk)))
 			panic("Attempted to kill init! exitcode=0x%08x\n",
 				tsk->signal->group_exit_code ?: (int)code);
-	}
 
 #ifdef CONFIG_POSIX_TIMERS
 		hrtimer_cancel(&tsk->signal->real_timer);
@@ -875,6 +862,15 @@ void __noreturn do_exit(long code)
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);
 
+	/*
+	 * Since sampling can touch ->mm, make sure to stop everything before we
+	 * tear it down.
+	 *
+	 * Also flushes inherited counters to the parent - before the parent
+	 * gets woken up by child-exit notifications.
+	 */
+	perf_event_exit_task(tsk);
+
 	exit_mm();
 
 	if (group_dead)
@@ -890,14 +886,6 @@ void __noreturn do_exit(long code)
 	exit_task_namespaces(tsk);
 	exit_task_work(tsk);
 	exit_thread(tsk);
-
-	/*
-	 * Flush inherited counters to the parent - before the parent
-	 * gets woken up by child-exit notifications.
-	 *
-	 * because of cgroup mode, must be called before cgroup_exit()
-	 */
-	perf_event_exit_task(tsk);
 
 	sched_autogroup_exit_task(tsk);
 	cgroup_exit(tsk);
@@ -997,6 +985,7 @@ void __noreturn make_task_dead(int signr)
 		futex_exit_recursive(tsk);
 		tsk->exit_state = EXIT_DEAD;
 		refcount_inc(&tsk->rcu_users);
+		preempt_disable();
 		do_task_dead();
 	}
 
@@ -1037,58 +1026,10 @@ do_group_exit(int exit_code)
 		}
 		spin_unlock_irq(&sighand->siglock);
 	}
-#ifdef CONFIG_XRECLAIMER
-	xreclaimer_cond_self_reclaim(exit_code);
-#endif
 
-#ifdef CONFIG_VIP_PAGE_CACHE_BUILDIN
-	update_top_uids(current, false);
-#endif
 	do_exit(exit_code);
 	/* NOTREACHED */
 }
-
-#ifdef CONFIG_HN_DIE_CATCH
-/*
- * catch_unexpected_exit,
- * difficult :if the signal handler, call exit,
- * it maybe will have some nested handler
- */
-int catch_unexpected_exit(int exit_code)
-{
-	struct signal_struct *sig = current->signal;
-	struct kernel_siginfo info;
-	unsigned short die_catch_flags = sig->unexpected_die_catch_flags;
-
-	if (strcmp(current->comm, "xcollie") == 0)
-		return 0;
-
-	/* reset the unexpected_die_catch_flags
-	 * to avoid recursive in signal handler
-	 */
-	sig->unexpected_die_catch_flags = 0;
-
-	memset(&info, 0, sizeof(info));
-
-	/* print critical process exit info */
-	if ((die_catch_flags & EXIT_CATCH_FLAG) || (die_catch_flags & EXIT_CATCH_FORAPP_FLAG))
-		pr_warn("ExitCatch: %s %d exited with exit_code %d\n",
-				current->comm, task_pid_nr(current), exit_code);
-
-	if (die_catch_flags & EXIT_CATCH_ABORT_FLAG) {
-		/*
-		 * Send a SIGABRT, regardless of whether we were in kernel
-		 * or user mode.
-		 */
-		info.si_signo = SIGABRT;
-		info.si_errno = 0;
-		info.si_code = 0;
-		force_sig_info(&info);
-		return 1;
-	}
-	return 0;
-}
-#endif
 
 /*
  * this kills every thread in the thread group. Note that any externally
@@ -1097,12 +1038,7 @@ int catch_unexpected_exit(int exit_code)
  */
 SYSCALL_DEFINE1(exit_group, int, error_code)
 {
-#ifdef CONFIG_HN_DIE_CATCH
-	if (!catch_unexpected_exit(error_code))
-		do_group_exit((error_code & 0xff) << 8);
-#else
 	do_group_exit((error_code & 0xff) << 8);
-#endif
 	/* NOTREACHED */
 	return 0;
 }
